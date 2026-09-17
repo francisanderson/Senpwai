@@ -122,7 +122,11 @@ class DownloadedEpisodeCount(CurrentAgainstTotal):
     def is_complete(self) -> bool:
         return self.current >= self.total
 
-    def update_count(self, added: int):
+    def update_count(self, added: int, manager: "DownloadManagerThread | None" = None):
+        # Stale callbacks from a cancelled download's leftover episodes must not
+        # mutate the shared counter or the next queued anime's bar after reset.
+        if manager is not None and manager is not self.download_window.current_download_manager_thread:
+            return
         super().update_count(added)
         complete = self.is_complete()
         if complete and self.total != 0 and SETTINGS.allow_notifications:
@@ -133,6 +137,12 @@ class DownloadedEpisodeCount(CurrentAgainstTotal):
                 lambda: open_folder(self.anime_folder_path),
             )
         if complete or self.cancelled:
+            bar = self.download_window.current_anime_progress_bar
+            if bar.total_value is None:
+                if self.cancelled or self.total == 0:
+                    bar.cancel()
+                else:
+                    bar.complete()
             self.start_next_download()
 
     def start_next_download(self):
@@ -346,6 +356,7 @@ class DownloadWindow(AbstractWindow):
         self.cancel_button: CancelAllButton
         self.folder_button: FolderButton
         self.downloaded_episode_count: DownloadedEpisodeCount
+        self.current_download_manager_thread: DownloadManagerThread | None = None
         self.tracked_download_timer = QTimer(self)
         self.tracked_download_timer.timeout.connect(self.start_tracked_download)
         self.setup_tracked_download_timer()
@@ -655,6 +666,7 @@ class DownloadWindow(AbstractWindow):
             self.current_anime_progress_bar,
             self.downloaded_episode_count,
         )
+        self.current_download_manager_thread = current_download_manager_thread
         self.pause_button.pause_callback = (
             current_download_manager_thread.pause_or_resume
         )
@@ -756,15 +768,19 @@ class DownloadManagerThread(QThread, ProgressFunction):
             self.download_slot_available.set()
 
     def update_eps_count_and_size(self, is_cancelled: bool, eps_file_path: str):
+        # A replaced download manager's leftover episodes must not mutate the
+        # shared episode counter or the current anime's HLS size estimate.
+        if self.download_window.current_download_manager_thread is not self:
+            return
         hls_est_size = self.download_window.hls_est_size
         if is_cancelled:
             if not self.downloaded_episode_count.cancelled:
                 self.downloaded_episode_count.total -= 1
-            self.downloaded_episode_count.update_count(0)
+            self.downloaded_episode_count.update_count(0, self)
             if hls_est_size:
                 hls_est_size.update_count(0)
         else:
-            self.downloaded_episode_count.update_count(1)
+            self.downloaded_episode_count.update_count(1, self)
             if hls_est_size:
                 eps_size = round(os.path.getsize(eps_file_path) / IBYTES_TO_MBS_DIVISOR)
                 hls_est_size.update_count(eps_size)
@@ -867,6 +883,10 @@ class DownloadThread(QThread):
     def cancel(self):
         self.download.cancel()
         divisor = 1 if self.is_hls_download else IBYTES_TO_MBS_DIVISOR
+        if self.anime_progress_bar.total_value is None:
+            self.anime_progress_bar.update_bar(-round(self.progress_bar.bar.value() / divisor))
+            self.is_cancelled = True
+            return
         new_maximum = self.anime_progress_bar.bar.maximum() - round(
             self.download_size / divisor
         )

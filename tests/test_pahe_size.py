@@ -29,10 +29,9 @@ calculate_total_download_size = namespace["calculate_total_download_size"]
 
 class DownloadSizeTests(unittest.TestCase):
     def test_missing_metadata_is_explicit(self):
-        for labels in (["Unknown"], ["100MB", "Unknown"]):
+        for labels in (["Unknown"], ["100MB", "Unknown"], ["", "250MB"]):
             with self.subTest(labels=labels):
-                with self.assertRaisesRegex(ValueError, "missing size metadata"):
-                    calculate_total_download_size(labels)
+                self.assertIsNone(calculate_total_download_size(labels))
 
     def test_valid_sizes_and_empty_list_are_unchanged(self):
         self.assertEqual(calculate_total_download_size(["720p 100MB", "1080p 250MB"]), 350)

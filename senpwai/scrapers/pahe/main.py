@@ -277,12 +277,13 @@ def bind_quality_to_link_info(
     return (bound_links, bound_info)
 
 
-def calculate_total_download_size(bound_info: list[str]) -> int:
+def calculate_total_download_size(bound_info: list[str]) -> int | None:
+    """Return total MB, or None if any episode's size metadata is missing."""
     total_size = 0
     for episode in bound_info:
         match = EPISODE_SIZE_REGEX.search(episode)
         if match is None:
-            raise ValueError("missing size metadata")
+            return None
         size = int(match.group(1))
         total_size += size
     return total_size 

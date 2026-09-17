@@ -368,7 +368,7 @@ class AnimeDetails:
         self.haved_end: int | None
         self.ddls_or_segs_urls: list[str] | list[list[str]]
         self.download_info: list[str]
-        self.total_download_size_mbs: int
+        self.total_download_size_mbs: int | None
         self.filler_episodes: list[int]
         self.lacked_episodes: list[int]
 
