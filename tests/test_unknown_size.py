@@ -140,7 +140,8 @@ class UnknownSizeTests(unittest.TestCase):
         manager_type = load_node("windows/download.py", "DownloadManagerThread", dict(
             QThread=type("QThread", (), {"__init__": lambda *a, **k: None}),
             ProgressFunction=type("ProgressFunction", (), {"__init__": lambda self: None}),
-            pyqtSignal=lambda *_, **__: None, Event=object, QMutex=object,
+            pyqtSignal=lambda *_, **__: None, pyqtSlot=lambda *_, **__: (lambda f: f),
+            Event=object, QMutex=object,
             AnimeDetails=object, DownloadWindow=object, ProgressBarWithoutButtons=object,
             DownloadedEpisodeCount=object, SETTINGS=SimpleNamespace(max_simultaneous_downloads=2),
             time=time,

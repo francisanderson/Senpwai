@@ -2,7 +2,7 @@ import os
 from threading import Event
 import time
 from typing import Callable, cast, TYPE_CHECKING
-from PyQt6.QtCore import QMutex, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QMutex, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLayoutItem,
@@ -17,6 +17,7 @@ from senpwai.common.classes import SETTINGS, AnimeDetails, get_max_part_size
 from senpwai.common.scraper import (
     IBYTES_TO_MBS_DIVISOR,
     Download,
+    InvalidDownloadResponse,
     ProgressFunction,
     ffmpeg_is_installed,
 )
@@ -129,7 +130,7 @@ class DownloadedEpisodeCount(CurrentAgainstTotal):
             return
         super().update_count(added)
         complete = self.is_complete()
-        if complete and self.total != 0 and SETTINGS.allow_notifications:
+        if complete and not self.cancelled and self.total != 0 and SETTINGS.allow_notifications:
             self.download_window.main_window.tray_icon.make_notification(
                 "Download Complete",
                 self.anime_title,
@@ -713,6 +714,7 @@ class DownloadWindow(AbstractWindow):
 class DownloadManagerThread(QThread, ProgressFunction):
     send_progress_bar_details = pyqtSignal(str, str, int, dict, bool)
     update_anime_progress_bar_signal = pyqtSignal(int)
+    failed = pyqtSignal(str)
 
     def __init__(
         self,
@@ -738,6 +740,17 @@ class DownloadManagerThread(QThread, ProgressFunction):
         self.prev_bar = None
         self.mutex = QMutex()
         self.cancelled = False
+        self.download_failed = Event()
+        self.failed.connect(self.handle_failure)
+
+    @pyqtSlot(str)
+    def handle_failure(self, message: str):
+        if self.download_window.current_download_manager_thread is not self or self.cancelled:
+            return
+        self.download_window.main_window.tray_icon.make_notification(
+            "Download failed", message, False, None
+        )
+        self.cancel()
 
     def pause_or_resume(self):
         if not self.cancelled:
@@ -747,12 +760,27 @@ class DownloadManagerThread(QThread, ProgressFunction):
         ProgressFunction.pause_or_resume(self)
 
     def cancel(self):
-        if self.resume.is_set() and not self.cancelled:
-            for bar in self.progress_bars.values():
-                bar.cancel_button.click()
-            self.downloaded_episode_count.cancelled = True
-            self.anime_progress_bar.cancel()
-            ProgressFunction.cancel(self)
+        if self.cancelled:
+            return
+        self.cancelled = True
+        self.resume.set()
+        self.download_slot_available.set()
+        self.downloaded_episode_count.cancelled = True
+        # A worker can be waiting for its bar between the manager's checks;
+        # fail it so it cannot launch uncancelled under the next anime.
+        self.download_failed.set()
+        for bar in list(self.progress_bars.values()):
+            if bar.paused:
+                bar.pause_button.click()
+            bar.cancel_button.click()
+        if self.anime_progress_bar.paused:
+            self.anime_progress_bar.pause_or_resume()
+        self.anime_progress_bar.cancel()
+        pause_button = self.download_window.pause_button
+        pause_button.paused = False
+        pause_button.setText("PAUSE")
+        pause_button.setStyleSheet(pause_button.not_paused_style_sheet)
+        self.downloaded_episode_count.update_count(0, self)
 
     def update_anime_progress_bar(self, added: int):
         if self.anime_details.is_hls_download:
@@ -762,15 +790,21 @@ class DownloadManagerThread(QThread, ProgressFunction):
             self.update_anime_progress_bar_signal.emit(added_rounded)
 
     def clean_up_finished_download(self, episode_title: str):
-        self.progress_bars.pop(episode_title)
+        self.progress_bars.pop(episode_title, None)
+        self.mutex.lock()
         self.ongoing_downloads_count -= 1
         if self.ongoing_downloads_count < SETTINGS.max_simultaneous_downloads:
             self.download_slot_available.set()
+        self.mutex.unlock()
 
     def update_eps_count_and_size(self, is_cancelled: bool, eps_file_path: str):
         # A replaced download manager's leftover episodes must not mutate the
         # shared episode counter or the current anime's HLS size estimate.
-        if self.download_window.current_download_manager_thread is not self:
+        if (
+            self.download_window.current_download_manager_thread is not self
+            or self.cancelled
+            or self.download_failed.is_set()
+        ):
             return
         hls_est_size = self.download_window.hls_est_size
         if is_cancelled:
@@ -789,6 +823,8 @@ class DownloadManagerThread(QThread, ProgressFunction):
         ddls_or_segs_urls = self.anime_details.ddls_or_segs_urls
         for idx, ddl_or_seg_urls in enumerate(ddls_or_segs_urls):
             self.download_slot_available.wait()
+            if self.cancelled or self.download_failed.is_set():
+                break
             shortened_episode_title = self.anime_details.episode_title(idx, True)
             episode_title = self.anime_details.episode_title(idx, False)
             if self.anime_details.is_hls_download:
@@ -796,15 +832,20 @@ class DownloadManagerThread(QThread, ProgressFunction):
             elif self.anime_details.download_sizes_bytes:
                 episode_size_or_segs = self.anime_details.download_sizes_bytes[idx]
             else:
-                (
-                    episode_size_or_segs,
-                    ddl_or_seg_urls,
-                ) = Download.get_total_download_size(cast(str, ddl_or_seg_urls))
+                try:
+                    (
+                        episode_size_or_segs,
+                        ddl_or_seg_urls,
+                    ) = Download.get_total_download_size(cast(str, ddl_or_seg_urls))
+                except InvalidDownloadResponse as error:
+                    self.download_failed.set()
+                    self.failed.emit(f"{episode_title}: {error}")
+                    return
 
             # This is specifcally at this point instead of at the top cause of the above http request made in
             # self.get_exact_episode_size such that if a user pauses or cancels as the request is in progress the input will be captured
             self.resume.wait()
-            if self.cancelled:
+            if self.cancelled or self.download_failed.is_set():
                 break
             self.mutex.lock()
             self.send_progress_bar_details.emit(
@@ -819,6 +860,19 @@ class DownloadManagerThread(QThread, ProgressFunction):
                 time.sleep(0.01)
                 continue
             episode_progress_bar = self.progress_bars[episode_title]
+            self.mutex.lock()
+            self.ongoing_downloads_count += 1
+            if self.ongoing_downloads_count >= SETTINGS.max_simultaneous_downloads:
+                self.download_slot_available.clear()
+            # Re-check after reserving so cancellation can never miss an episode.
+            proceed = not (self.cancelled or self.download_failed.is_set())
+            if not proceed:
+                self.ongoing_downloads_count -= 1
+                if self.ongoing_downloads_count < SETTINGS.max_simultaneous_downloads:
+                    self.download_slot_available.set()
+            self.mutex.unlock()
+            if not proceed:
+                break
             DownloadThread(
                 self,
                 ddl_or_seg_urls,
@@ -835,9 +889,6 @@ class DownloadManagerThread(QThread, ProgressFunction):
                 self.update_eps_count_and_size,
                 self.mutex,
             ).start()
-            self.ongoing_downloads_count += 1
-            if self.ongoing_downloads_count >= SETTINGS.max_simultaneous_downloads:
-                self.download_slot_available.clear()
 
 
 class DownloadThread(QThread):
@@ -863,6 +914,7 @@ class DownloadThread(QThread):
         mutex: QMutex,
     ) -> None:
         super().__init__(parent)
+        self.manager = parent
         self.ddl_or_seg_urls = ddl_or_seg_urls
         self.title = title
         self.download_size = size
@@ -917,13 +969,22 @@ class DownloadThread(QThread):
         self.progress_bar.pause_callback = self.download.pause_or_resume
         self.progress_bar.cancel_callback = self.cancel
 
-        self.download.start_download()
-        self.mutex.lock()
-        self.finished.emit(self.title)
-        self.update_eps_count_and_hls_sizes.emit(
-            self.is_cancelled, self.download.file_path
-        )
-        self.mutex.unlock()
+        try:
+            self.download.start_download()
+            self.update_eps_count_and_hls_sizes.emit(
+                self.is_cancelled, self.download.file_path
+            )
+        except InvalidDownloadResponse as error:
+            self.mutex.lock()
+            failed = not self.download.cancelled
+            self.mutex.unlock()
+            if failed:
+                self.manager.download_failed.set()
+                self.manager.failed.emit(f"{self.title}: {error}")
+        finally:
+            self.mutex.lock()
+            self.finished.emit(self.title)
+            self.mutex.unlock()
 
 
 class GogoGetDownloadPageLinksThread(QThread):
@@ -1148,6 +1209,7 @@ class PaheGetDownloadPageThread(QThread):
 
 class GetDirectDownloadLinksThread(QThread):
     finished = pyqtSignal(AnimeDetails)
+    failed = pyqtSignal(str)
     update_bar = pyqtSignal(int)
 
     def __init__(
@@ -1165,8 +1227,16 @@ class GetDirectDownloadLinksThread(QThread):
         self.download_info = download_info
         self.anime_details = anime_details
         self.finished.connect(finished_callback)
+        self.failed.connect(self.handle_failure)
         self.progress_bar = progress_bar
         self.update_bar.connect(progress_bar.update_bar)
+
+    @pyqtSlot(str)
+    def handle_failure(self, message: str):
+        self.download_window.main_window.tray_icon.make_notification(
+            "Download failed", message, False, None
+        )
+        self.progress_bar.cancel_callback()
 
     def run(self):
         if self.anime_details.site == PAHE:
@@ -1192,14 +1262,20 @@ class GetDirectDownloadLinksThread(QThread):
             obj = gogo.GetDirectDownloadLinks()
             self.progress_bar.pause_callback = obj.pause_or_resume
             self.progress_bar.cancel_callback = obj.cancel
-            (
-                self.anime_details.ddls_or_segs_urls,
-                download_sizes,
-            ) = obj.get_direct_download_links(
-                cast(list[str], self.download_page_links),
-                self.anime_details.quality,
-                lambda x: self.update_bar.emit(x),
-            )
+            try:
+                (
+                    self.anime_details.ddls_or_segs_urls,
+                    download_sizes,
+                ) = obj.get_direct_download_links(
+                    cast(list[str], self.download_page_links),
+                    self.anime_details.quality,
+                    lambda x: self.update_bar.emit(x),
+                )
+            except InvalidDownloadResponse as error:
+                self.failed.emit(
+                    f"{self.anime_details.sanitised_title}: {error}"
+                )
+                return
             self.anime_details.download_sizes_bytes = download_sizes
             self.anime_details.total_download_size_mbs = (
                 sum(download_sizes) // IBYTES_TO_MBS_DIVISOR

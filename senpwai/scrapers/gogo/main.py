@@ -11,7 +11,7 @@ from senpwai.common.scraper import (
     AnimeMetadata,
     DomainNameError,
     Download,
-    NoResourceLengthException,
+    InvalidDownloadResponse,
     ProgressFunction,
     get_new_home_url_from_readme,
     closest_quality_index,
@@ -89,25 +89,24 @@ class GetDirectDownloadLinks(ProgressFunction):
         direct_download_links: list[str] = []
         download_sizes: list[int] = []
         for eps_pg_link in download_page_links:
-            link = ""
-            size = 0
-            while True:
-                response = CLIENT.get(eps_pg_link, cookies=get_session_cookies())
-                soup = BeautifulSoup(response.content, PARSER)
-                a_tags = cast(
-                    ResultSet[Tag],
-                    cast(Tag, soup.find("div", class_="cf-download")).find_all("a"),
+            self.resume.wait()
+            if self.cancelled:
+                return [], []
+            response = CLIENT.get(eps_pg_link, cookies=get_session_cookies())
+            soup = BeautifulSoup(response.content, PARSER)
+            container = soup.find("div", class_="cf-download")
+            a_tags = cast(ResultSet[Tag], container.find_all("a")) if container else []
+            if not response.ok or not a_tags:
+                raise InvalidDownloadResponse(
+                    "No download links available. Refresh the page or try another source."
                 )
-                qualities = [a.text for a in a_tags]
-                idx = closest_quality_index(qualities, user_quality)
-                link = cast(str, a_tags[idx]["href"])
-                if not link:
-                    continue
-                try:
-                    size, link = Download.get_total_download_size(link)
-                    break
-                except NoResourceLengthException:
-                    continue
+            qualities = [a.text for a in a_tags]
+            idx = closest_quality_index(qualities, user_quality)
+            link = cast(str, a_tags[idx].get("href", ""))
+            if not link:
+                raise InvalidDownloadResponse("Empty download link. Try another source.")
+            # Abort rather than drop an episode and shift the remaining episode titles.
+            size, link = Download.get_total_download_size(link)
             direct_download_links.append(link)
             download_sizes.append(size)
             self.resume.wait()

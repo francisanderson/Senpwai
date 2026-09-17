@@ -8,7 +8,7 @@ from string import ascii_letters, digits, printable
 from threading import Event
 import threading
 import time
-from typing import Callable, Iterator, TypeVar, cast
+from typing import Callable, TypeVar, cast
 from webbrowser import open_new_tab
 
 import requests
@@ -83,7 +83,11 @@ USER_AGENTS = (
 )
 
 
-class NoResourceLengthException(Exception):
+class InvalidDownloadResponse(Exception):
+    """The server did not return a usable download response."""
+
+
+class NoResourceLengthException(InvalidDownloadResponse):
     def __init__(self, url: str, redirect_url: str) -> None:
         msg = (
             f'Received no resource length from "{url}"'
@@ -444,13 +448,47 @@ class Download(ProgressFunction):
         self.rm_temp_path()
 
     @staticmethod
+    def validate_response(response: requests.Response) -> None:
+        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if not 200 <= response.status_code < 300 or content_type in (
+            "text/html", "application/xhtml+xml", "application/json",
+        ):
+            raise InvalidDownloadResponse(
+                f"Invalid download response (HTTP {response.status_code}, "
+                f"{content_type or 'unspecified content type'}). "
+                "Refresh the download link or try another source."
+            )
+
+    @staticmethod
     def get_total_download_size(url: str) -> tuple[int, str]:
-        response = CLIENT.get(url, stream=True, allow_redirects=True)
-        resource_length_str = response.headers.get("Content-Length", None)
-        redirect_url = response.url
-        if resource_length_str is None:
-            raise NoResourceLengthException(url, redirect_url)
-        return (int(resource_length_str), redirect_url)
+        try:
+            response = CLIENT.get(
+                url, stream=True, allow_redirects=True, timeout=30,
+                exceptions_to_raise=(requests.exceptions.RequestException,),
+            )
+        except requests.exceptions.RequestException as exc:
+            raise InvalidDownloadResponse(
+                "Download lookup failed. Check your connection and refresh the download link."
+            ) from exc
+        try:
+            Download.validate_response(response)
+            resource_length_str = response.headers.get("Content-Length", None)
+            redirect_url = response.url
+            if resource_length_str is None:
+                raise NoResourceLengthException(url, redirect_url)
+            try:
+                resource_length = int(resource_length_str)
+            except ValueError:
+                raise InvalidDownloadResponse(
+                    "Invalid resource length. Refresh the download link or try another source."
+                ) from None
+            if resource_length <= 0:
+                raise InvalidDownloadResponse(
+                    "Invalid resource length. Refresh the download link or try another source."
+                )
+            return (resource_length, redirect_url)
+        finally:
+            response.close()
 
     def cancel(self):
         return super().cancel()
@@ -462,10 +500,18 @@ class Download(ProgressFunction):
             try_deleting(self.temp_path)
 
     def start_download(self):
-        if self.is_hls_download:
-            self.hls_download()
-        else:
-            self.normal_download()
+        try:
+            if self.is_hls_download:
+                self.hls_download()
+            else:
+                self.normal_download()
+        except (InvalidDownloadResponse, requests.exceptions.RequestException) as exc:
+            self.rm_temp_path()
+            if isinstance(exc, InvalidDownloadResponse):
+                raise
+            raise InvalidDownloadResponse(
+                "Download interrupted. Check your connection and retry with a fresh link."
+            ) from exc
         if self.cancelled:
             self.rm_temp_path()
             return
@@ -504,49 +550,49 @@ class Download(ProgressFunction):
                 self.progress_update_callback(1)
 
     def normal_download(self) -> None:
-        def download(
-            start_byte: int,
-            part_size: int,
-            temp_file_path: str,
-            is_retry=False,
-            thread_num=1,
-        ) -> None:
-            with open(temp_file_path, "ab" if is_retry else "wb") as file:
-                end_byte = start_byte + part_size - 1
-                self.link_or_segment_urls = cast(str, self.link_or_segment_urls)
-                headers = CLIENT.make_headers(
-                    {"Range": f"bytes={start_byte}-{end_byte}"}
-                )
-                response = CLIENT.get(
-                    self.link_or_segment_urls,
-                    stream=True,
-                    headers=headers,
-                    timeout=30,
-                    cookies=self.cookies,
-                )
-                iter_content = cast(
-                    Iterator[bytes],
-                    response.iter_content(chunk_size=IBYTES_TO_MBS_DIVISOR),
-                )
-                while response.ok:
-                    try:
-                        downloaded_data = CLIENT.network_error_retry_wrapper(
-                            lambda: next(iter_content)
-                        )
+        def download(start_byte: int, part_size: int, temp_file_path: str) -> None:
+            end_byte = start_byte + part_size - 1
+            headers = CLIENT.make_headers({"Range": f"bytes={start_byte}-{end_byte}"})
+            response = CLIENT.get(
+                cast(str, self.link_or_segment_urls), stream=True, headers=headers,
+                timeout=30, cookies=self.cookies,
+                exceptions_to_raise=(requests.exceptions.RequestException,),
+            )
+            try:
+                self.validate_response(response)
+                if part_size < self.download_size and (
+                    response.status_code != 206
+                    or response.headers.get("Content-Range") !=
+                    f"bytes {start_byte}-{end_byte}/{self.download_size}"
+                ):
+                    raise InvalidDownloadResponse(
+                        "Server returned an invalid byte range. Disable multipart downloads and retry."
+                    )
+                received = 0
+                with open(temp_file_path, "wb") as file:
+                    for data in response.iter_content(chunk_size=IBYTES_TO_MBS_DIVISOR):
                         self.resume.wait()
                         if self.cancelled:
                             return
-                        data_size = file.write(downloaded_data)
+                        received += len(data)
+                        if received > part_size:
+                            raise InvalidDownloadResponse("Download exceeds expected length. Refresh the link and retry.")
+                        file.write(data)
                         with self.update_lock:
-                            self.progress_update_callback(data_size)
-                    except StopIteration:
-                        break
+                            self.progress_update_callback(len(data))
+                if received != part_size:
+                    raise InvalidDownloadResponse("Download ended before its expected length. Refresh the link and retry.")
+            finally:
+                response.close()
 
-            file_size = os.path.getsize(temp_file_path)
-            if file_size < part_size:
-                download(
-                    file_size, part_size, temp_file_path, True, thread_num=thread_num
-                )
+        errors: list[Exception] = []
+
+        def download_part(start_byte: int, part_size: int, temp_file_path: str):
+            try:
+                download(start_byte, part_size, temp_file_path)
+            except Exception as exc:
+                with self.update_lock:
+                    errors.append(exc)
 
         if not self.max_part_size or self.max_part_size >= self.download_size:
             download(0, self.download_size, self.temp_path)
@@ -562,9 +608,8 @@ class Download(ProgressFunction):
             temp_file_path = os.path.join(self.temp_path, f"{part_num}.part")
 
             download_thread = threading.Thread(
-                target=lambda: download(
-                    current_size, download_size, temp_file_path, thread_num=part_num
-                ),
+                target=download_part,
+                args=(current_size, download_size, temp_file_path),
                 daemon=True,
             )
             download_thread.start()
@@ -573,6 +618,8 @@ class Download(ProgressFunction):
         # Not using join() since it doesn't honour KeyboardInterrupt
         while any(dt.is_alive() for dt in download_threads):
             time.sleep(0.1)
+        if errors:
+            raise errors[0]
 
 
 def test_multipart_download():
