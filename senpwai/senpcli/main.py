@@ -24,6 +24,7 @@ from senpwai.common.scraper import (
     IBYTES_TO_MBS_DIVISOR,
     AiringStatus,
     Download,
+    InvalidDownloadResponse,
     ffmpeg_is_installed,
     strip_title,
     try_installing_ffmpeg,
@@ -390,13 +391,15 @@ def gogo_get_direct_download_links(
         desc="Retrieving direct download links",
         unit="eps",
     )
-    (
-        direct_download_links,
-        download_sizes,
-    ) = gogo.GetDirectDownloadLinks().get_direct_download_links(
-        download_page_links, quality, pbar.update_
-    )
-    pbar.close_()
+    try:
+        (
+            direct_download_links,
+            download_sizes,
+        ) = gogo.GetDirectDownloadLinks().get_direct_download_links(
+            download_page_links, quality, pbar.update_
+        )
+    finally:
+        pbar.close_()
     size = sum(download_sizes) // IBYTES_TO_MBS_DIVISOR
     size_text = add_color(
         f"{size} MB {', go shower' if size >= 1000 else ''}", Color.MAGENTA
@@ -451,24 +454,30 @@ def download_thread(
     link_or_segs_urls: str | list[str],
     anime_details: AnimeDetails,
     is_hls_download: bool,
-    finished_callback: Callable[[], None],
+    finished_callback: Callable[[bool], None],
     download_size: int,
 ):
-    max_part_size = get_max_part_size(
-        download_size, anime_details.site, is_hls_download
-    )
-    download = Download(
-        link_or_segs_urls,
-        episode_title,
-        anime_details.anime_folder_path,
-        download_size,
-        pbar.update_,
-        is_hls_download=is_hls_download,
-        max_part_size=max_part_size,
-    )
-    download.start_download()
-    pbar.close_()
-    finished_callback()
+    succeeded = False
+    try:
+        max_part_size = get_max_part_size(
+            download_size, anime_details.site, is_hls_download
+        )
+        download = Download(
+            link_or_segs_urls,
+            episode_title,
+            anime_details.anime_folder_path,
+            download_size,
+            pbar.update_,
+            is_hls_download=is_hls_download,
+            max_part_size=max_part_size,
+        )
+        download.start_download()
+        succeeded = True
+    except InvalidDownloadResponse as error:
+        print_error(f"Failed to download {episode_title}: {error}")
+    finally:
+        pbar.close_()
+        finished_callback(succeeded)
 
 
 def download_manager(
@@ -488,17 +497,21 @@ def download_manager(
     download_slot_available = Event()
     download_slot_available.set()
     downloads_complete = Event()
+    downloads_complete.set()
     curr_simultaneous_downloads = 0
+    failures = 0
     update_lock = Lock()
 
-    def update_progress():
+    def update_progress(succeeded: bool):
         with update_lock:
-            nonlocal curr_simultaneous_downloads
+            nonlocal curr_simultaneous_downloads, failures
             curr_simultaneous_downloads -= 1
+            failures += not succeeded
             if curr_simultaneous_downloads < max_simultaneous_downloads:
                 download_slot_available.set()
-            episodes_pbar.update_(1)
-            if episodes_pbar.n == episodes_pbar.total:
+            if succeeded:
+                episodes_pbar.update_(1)
+            if curr_simultaneous_downloads == 0:
                 downloads_complete.set()
 
     def wait(event: Event):
@@ -506,39 +519,56 @@ def download_manager(
         while not event.wait(0.1):
             pass
 
-    for idx, link in enumerate(ddls_or_segs_urls):
-        wait(download_slot_available)
-        shortened_episode_title = anime_details.episode_title(idx, True)
-        if download_sizes:
-            download_size = download_sizes[idx]
-        elif is_hls_download:
-            download_size = len(link)
-        else:
-            download_size, link = Download.get_total_download_size(cast(str, link))
-        pbar, link = create_progress_bar(
-            shortened_episode_title, link, is_hls_download, download_size
-        )
-        episode_title = anime_details.episode_title(idx, False)
+    try:
+        for idx, link in enumerate(ddls_or_segs_urls):
+            wait(download_slot_available)
+            shortened_episode_title = anime_details.episode_title(idx, True)
+            try:
+                if download_sizes:
+                    download_size = download_sizes[idx]
+                elif is_hls_download:
+                    download_size = len(link)
+                else:
+                    download_size, link = Download.get_total_download_size(cast(str, link))
+                pbar, link = create_progress_bar(
+                    shortened_episode_title, link, is_hls_download, download_size
+                )
+            except InvalidDownloadResponse as error:
+                with update_lock:
+                    failures += 1
+                print_error(f"Failed to download {shortened_episode_title}: {error}")
+                continue
+            episode_title = anime_details.episode_title(idx, False)
 
-        Thread(
-            target=lambda: download_thread(
-                pbar,
-                episode_title,
-                link,
-                anime_details,
-                is_hls_download,
-                update_progress,
-                download_size,
-            ),
-            daemon=True,
-        ).start()
-        curr_simultaneous_downloads += 1
-        if curr_simultaneous_downloads == max_simultaneous_downloads:
-            download_slot_available.clear()
+            with update_lock:
+                curr_simultaneous_downloads += 1
+                downloads_complete.clear()
+                if curr_simultaneous_downloads >= max_simultaneous_downloads:
+                    download_slot_available.clear()
+            Thread(
+                target=download_thread,
+                args=(
+                    pbar,
+                    episode_title,
+                    link,
+                    anime_details,
+                    is_hls_download,
+                    update_progress,
+                    download_size,
+                ),
+                daemon=True,
+            ).start()
 
-    wait(downloads_complete)
-    episodes_pbar.close_()
+        wait(downloads_complete)
+    finally:
+        episodes_pbar.close_()
 
+    if failures:
+        print_error(f"Download incomplete: {failures} episode(s) failed. Refresh links or try another source.")
+        return
+    if not ddls_or_segs_urls:
+        print_error("Nothing was available to download. Refresh links or try another source.")
+        return
     print_rainbow(
         f"Download complete uWu, Senpcli ga saikou no stando da!!!\n{random.choice(ANIME_REFERENCES)}"
     )
@@ -728,8 +758,10 @@ def download_and_install_update(
         file_ext,
         max_part_size=SETTINGS.max_part_size_bytes(),
     )
-    download.start_download()
-    pbar.close_()
+    try:
+        download.start_download()
+    finally:
+        pbar.close_()
     subprocess.Popen([os.path.join(tempdir, file_name), "/silent"])
 
 
@@ -940,6 +972,9 @@ def main():
             initiate_download_pipeline(parsed, anime_details)
             finish_update_check(*update_params)
 
+    except InvalidDownloadResponse as error:
+        print_error(f"Download failed: {error}")
+        ProgressBar.cancel_all_active()
     except KeyboardInterrupt:
         ProgressBar.cancel_all_active()
 
