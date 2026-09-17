@@ -414,11 +414,12 @@ def pahe_get_direct_download_links(download_page_links: list[str]) -> list[str]:
         desc="Retrieving direct download links",
         unit="eps",
     )
-    results = pahe.GetDirectDownloadLinks().get_direct_download_links(
-        download_page_links, pbar.update_
-    )
-    pbar.close_()
-    return results
+    try:
+        return pahe.GetDirectDownloadLinks().get_direct_download_links(
+            download_page_links, pbar.update_
+        )
+    finally:
+        pbar.close_()
 
 
 def create_progress_bar(

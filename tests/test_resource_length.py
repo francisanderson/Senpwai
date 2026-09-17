@@ -171,7 +171,8 @@ class GuiFailureSignalTests(unittest.TestCase):
         )
         thread.anime_details = SimpleNamespace(site="GOGO", quality="1080p", sanitised_title="Example")
         thread.download_page_links = ["page"]
-        thread.progress_bar = Mock()
+        thread.progress_bar = Mock(paused=False)
+        thread.progress_bar.cancel.side_effect = lambda: thread.progress_bar.cancel_callback()
         thread.run()
         thread_type.failed.emit.assert_called_once()
         self.assertIn("Example", thread_type.failed.emit.call_args[0][0])
@@ -268,6 +269,92 @@ class CliFailureAccountingTests(unittest.TestCase):
         )
         manager(["link"], anime_details, False, 2, None)
         # No success message means failures were accounted; nothing raised or hung.
+
+
+class PaheLinkResponseTests(unittest.TestCase):
+    def test_missing_kwik_link_raises_actionable_error(self):
+        from senpwai.scrapers.pahe import main as pahe
+
+        with patch.object(pahe.CLIENT, "get", return_value=SimpleNamespace(text="<html>Unavailable</html>")):
+            with self.assertRaisesRegex(InvalidDownloadResponse, "Animepahe.*[Rr]etry"):
+                pahe.GetDirectDownloadLinks().get_direct_download_links(["https://fixture.invalid/page"])
+
+    def test_missing_parameters_aborts_without_partial_result(self):
+        from senpwai.scrapers.pahe import main as pahe
+
+        progress = Mock()
+        with patch.object(pahe.CLIENT, "get", side_effect=[
+            SimpleNamespace(text="https://kwik.cx/f/fixture"),
+            SimpleNamespace(text="<html>Unavailable</html>"),
+        ]) as get:
+            with self.assertRaisesRegex(InvalidDownloadResponse, "Animepahe.*parameters.*[Rr]etry"):
+                pahe.GetDirectDownloadLinks().get_direct_download_links(["page1", "page2"], progress)
+        self.assertEqual(get.call_count, 2)
+        progress.assert_not_called()
+
+    def test_cli_closes_progress_bar_on_provider_error(self):
+        bar = Mock()
+        collector = Mock()
+        collector.get_direct_download_links.side_effect = InvalidDownloadResponse("Animepahe unavailable")
+        function = load_node("senpcli/main.py", "pahe_get_direct_download_links", dict(
+            ProgressBar=Mock(return_value=bar),
+            pahe=SimpleNamespace(GetDirectDownloadLinks=lambda: collector),
+        ))
+        with self.assertRaises(InvalidDownloadResponse):
+            function(["page"])
+        bar.close_.assert_called_once()
+
+    def test_gui_pahe_failure_notifies_cancels_bar_and_never_queues(self):
+        from typing import Callable, cast
+        from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot
+        from PyQt6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        collector = Mock()
+        collector.get_direct_download_links.side_effect = InvalidDownloadResponse("Animepahe unavailable")
+        provider = SimpleNamespace(
+            GetDirectDownloadLinks=lambda: collector,
+            bind_sub_or_dub_to_link_info=lambda *_: (["page"], ["1080p 10MB"]),
+            bind_quality_to_link_info=lambda *_: (["page"], ["1080p 10MB"]),
+        )
+        cls = load_node("windows/download.py", "GetDirectDownloadLinksThread", dict(
+            QThread=QThread, pyqtSignal=pyqtSignal, pyqtSlot=pyqtSlot,
+            AnimeDetails=object, DownloadWindow=object, ProgressBarWithButtons=object,
+            Callable=Callable, cast=cast, PAHE="PAHE", pahe=provider,
+            InvalidDownloadResponse=InvalidDownloadResponse,
+        ))
+        details = SimpleNamespace(site="PAHE", sub_or_dub="sub", quality="1080p", sanitised_title="Example", ddls_or_segs_urls=[])
+        queued = Mock()
+        bar = Mock(paused=False)
+        bar.cancel.side_effect = lambda: bar.cancel_callback()
+        thread = cls(None, [["page"]], [["1080p 10MB"]], details, queued, bar)
+        notice = Mock()
+        thread.download_window = SimpleNamespace(main_window=SimpleNamespace(tray_icon=SimpleNamespace(make_notification=notice)))
+        thread.run()
+        app.processEvents()
+        notice.assert_called_once_with("Download failed", "Example: Animepahe unavailable", False, None)
+        bar.cancel.assert_called_once()
+        collector.cancel.assert_called_once()
+        queued.assert_not_called()
+        self.assertEqual(details.ddls_or_segs_urls, [])
+
+    def test_valid_link_response_preserves_order_and_progress(self):
+        from senpwai.scrapers.pahe import main as pahe
+
+        progress = Mock()
+        with patch.object(pahe.CLIENT, "get", side_effect=[
+            SimpleNamespace(text="https://kwik.cx/f/fixture"),
+            SimpleNamespace(text='("abc",1,"abc",1,2,3)', cookies={}),
+        ] * 2), patch.object(pahe, "decrypt_post_form", return_value=
+            '<form action="https://fixture.invalid/post"><input value="x"></form>'
+        ), patch.object(pahe.CLIENT, "post", side_effect=[
+            SimpleNamespace(headers={"Location": f"https://fixture.invalid/{i}.mp4"})
+            for i in (1, 2)
+        ]):
+            links = pahe.GetDirectDownloadLinks().get_direct_download_links(["page1", "page2"], progress)
+        self.assertEqual(links, ["https://fixture.invalid/1.mp4", "https://fixture.invalid/2.mp4"])
+        self.assertEqual(progress.call_count, 2)
+        progress.assert_called_with(1)
 
 
 if __name__ == "__main__":

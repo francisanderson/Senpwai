@@ -1236,7 +1236,9 @@ class GetDirectDownloadLinksThread(QThread):
         self.download_window.main_window.tray_icon.make_notification(
             "Download failed", message, False, None
         )
-        self.progress_bar.cancel_callback()
+        if self.progress_bar.paused:
+            self.progress_bar.pause_or_resume()
+        self.progress_bar.cancel()
 
     def run(self):
         if self.anime_details.site == PAHE:
@@ -1252,9 +1254,13 @@ class GetDirectDownloadLinksThread(QThread):
             obj = pahe.GetDirectDownloadLinks()
             self.progress_bar.pause_callback = obj.pause_or_resume
             self.progress_bar.cancel_callback = obj.cancel
-            self.anime_details.ddls_or_segs_urls = obj.get_direct_download_links(
-                bound_links, lambda x: self.update_bar.emit(x)
-            )
+            try:
+                self.anime_details.ddls_or_segs_urls = obj.get_direct_download_links(
+                    bound_links, lambda x: self.update_bar.emit(x)
+                )
+            except InvalidDownloadResponse as error:
+                self.failed.emit(f"{self.anime_details.sanitised_title}: {error}")
+                return
             self.anime_details.total_download_size_mbs = (
                 pahe.calculate_total_download_size(bound_info)
             )
