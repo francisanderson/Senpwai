@@ -77,7 +77,11 @@ class DomainAlignmentTests(unittest.TestCase):
         )
 
     def test_pahe_urls_are_constructed_from_pahe_domain(self):
-        self.assertEqual(PAHE_DOMAIN, "animepahe.com")
+        # animepahe.com is a 301 alias of animepahe.pw (verified 2026-09-17);
+        # the maintainer's active v3.0.0 branch also pins .pw. The app requests
+        # with allow_redirects=False, so the constant must be the canonical
+        # domain, not the alias.
+        self.assertEqual(PAHE_DOMAIN, "animepahe.pw")
         self.assertIn(f"PAHE_DOMAIN = \"{PAHE_DOMAIN}\"", PAHE_CONSTANTS)
 
     def test_gogo_home_url_is_pinned_to_maintainer_readme(self):
