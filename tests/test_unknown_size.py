@@ -129,6 +129,46 @@ class UnknownSizeTests(unittest.TestCase):
         self.assertTrue(bar.is_complete())
         self.assertIn("Completed", bar.bar.format())
 
+    def test_stale_manager_callback_leaves_shared_counter_untouched(self):
+        class Counter:
+            def update_count(self, added):
+                self.current += added
+
+        count_type = load_node("windows/download.py", "DownloadedEpisodeCount", dict(
+            CurrentAgainstTotal=Counter, SETTINGS=SimpleNamespace(allow_notifications=False),
+        ))
+        manager_type = load_node("windows/download.py", "DownloadManagerThread", dict(
+            QThread=type("QThread", (), {"__init__": lambda *a, **k: None}),
+            ProgressFunction=type("ProgressFunction", (), {"__init__": lambda self: None}),
+            pyqtSignal=lambda *_, **__: None, Event=object, QMutex=object,
+            AnimeDetails=object, DownloadWindow=object, ProgressBarWithoutButtons=object,
+            DownloadedEpisodeCount=object, SETTINGS=SimpleNamespace(max_simultaneous_downloads=2),
+            time=time,
+        ))
+        bar = self.make_bar(None)
+        stale = manager_type.__new__(manager_type)
+        stale.download_window = SimpleNamespace(
+            current_download_manager_thread=object(), hls_est_size=SimpleNamespace(update_count=Mock()),
+        )
+        stale.downloaded_episode_count = count_type.__new__(count_type)
+        stale.downloaded_episode_count.current = 0
+        stale.downloaded_episode_count.total = 2
+        stale.downloaded_episode_count.cancelled = False
+        stale.downloaded_episode_count.download_window = SimpleNamespace(
+            current_anime_progress_bar=bar, current_download_manager_thread=stale.download_window.current_download_manager_thread,
+        )
+        # Leftover cancelled episode after the counter reset to the new anime:
+        stale.update_eps_count_and_size(True, "ignored")
+        self.assertEqual(stale.downloaded_episode_count.total, 2)
+        self.assertEqual(stale.downloaded_episode_count.current, 0)
+        self.assertFalse(bar.cancelled)
+        self.assertFalse(bar.is_complete())
+        stale.downloaded_episode_count.hls_est_size = None
+        # Leftover successful episode must not advance the new anime's counter either:
+        stale.update_eps_count_and_size(False, "unused")
+        self.assertEqual(stale.downloaded_episode_count.current, 0)
+        stale.download_window.hls_est_size.update_count.assert_not_called()
+
     def test_unknown_aggregate_cancellation_uses_episode_values_not_maximum(self):
         thread_type = load_node("windows/download.py", "DownloadThread", dict(
             QThread=type("QThread", (), {}), pyqtSignal=lambda *_, **__: None,

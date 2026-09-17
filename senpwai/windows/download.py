@@ -123,6 +123,10 @@ class DownloadedEpisodeCount(CurrentAgainstTotal):
         return self.current >= self.total
 
     def update_count(self, added: int, manager: "DownloadManagerThread | None" = None):
+        # Stale callbacks from a cancelled download's leftover episodes must not
+        # mutate the shared counter or the next queued anime's bar after reset.
+        if manager is not None and manager is not self.download_window.current_download_manager_thread:
+            return
         super().update_count(added)
         complete = self.is_complete()
         if complete and self.total != 0 and SETTINGS.allow_notifications:
@@ -133,10 +137,6 @@ class DownloadedEpisodeCount(CurrentAgainstTotal):
                 lambda: open_folder(self.anime_folder_path),
             )
         if complete or self.cancelled:
-            # Stale callbacks from a cancelled download's leftover episodes must not
-            # touch the next queued anime's bar after the shared counter resets.
-            if manager is not None and manager is not self.download_window.current_download_manager_thread:
-                return
             bar = self.download_window.current_anime_progress_bar
             if bar.total_value is None:
                 if self.cancelled or self.total == 0:
@@ -768,6 +768,10 @@ class DownloadManagerThread(QThread, ProgressFunction):
             self.download_slot_available.set()
 
     def update_eps_count_and_size(self, is_cancelled: bool, eps_file_path: str):
+        # A replaced download manager's leftover episodes must not mutate the
+        # shared episode counter or the current anime's HLS size estimate.
+        if self.download_window.current_download_manager_thread is not self:
+            return
         hls_est_size = self.download_window.hls_est_size
         if is_cancelled:
             if not self.downloaded_episode_count.cancelled:
