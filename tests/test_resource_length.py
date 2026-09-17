@@ -325,14 +325,21 @@ class PaheLinkResponseTests(unittest.TestCase):
         ))
         details = SimpleNamespace(site="PAHE", sub_or_dub="sub", quality="1080p", sanitised_title="Example", ddls_or_segs_urls=[])
         queued = Mock()
-        bar = Mock(paused=False)
-        bar.cancel.side_effect = lambda: bar.cancel_callback()
+        bar = Mock(paused=True)
+        def resume_bar():
+            bar.paused = False
+            bar.pause_callback()
+        bar.pause_or_resume.side_effect = resume_bar
+        bar.cancel.side_effect = lambda: bar.cancel_callback() if not bar.paused else None
         thread = cls(None, [["page"]], [["1080p 10MB"]], details, queued, bar)
         notice = Mock()
         thread.download_window = SimpleNamespace(main_window=SimpleNamespace(tray_icon=SimpleNamespace(make_notification=notice)))
         thread.run()
         app.processEvents()
         notice.assert_called_once_with("Download failed", "Example: Animepahe unavailable", False, None)
+        bar.pause_or_resume.assert_called_once()
+        collector.pause_or_resume.assert_called_once()
+        self.assertFalse(bar.paused)
         bar.cancel.assert_called_once()
         collector.cancel.assert_called_once()
         queued.assert_not_called()
