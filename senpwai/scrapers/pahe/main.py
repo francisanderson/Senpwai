@@ -280,7 +280,9 @@ def bind_quality_to_link_info(
 def calculate_total_download_size(bound_info: list[str]) -> int:
     total_size = 0
     for episode in bound_info:
-        match = cast(re.Match, EPISODE_SIZE_REGEX.search(episode))
+        match = EPISODE_SIZE_REGEX.search(episode)
+        if match is None:
+            raise ValueError("missing size metadata")
         size = int(match.group(1))
         total_size += size
     return total_size 
