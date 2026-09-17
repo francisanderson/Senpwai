@@ -1,4 +1,3 @@
-import re
 import math
 from typing import Any, Callable, NamedTuple, cast
 from requests import Response
@@ -9,6 +8,7 @@ from senpwai.common.scraper import (
     AiringStatus,
     AnimeMetadata,
     DomainNameError,
+    InvalidDownloadResponse,
     ProgressFunction,
     get_new_home_url_from_readme,
     closest_quality_index,
@@ -330,13 +330,22 @@ class GetDirectDownloadLinks(ProgressFunction):
         for pahewin_link in pahewin_download_page_links:
             # Extract kwik page links
             pahewin_html_page = CLIENT.get(pahewin_link).text
-            kwik_page_link = cast(
-                re.Match[str], KWIK_PAGE_REGEX.search(pahewin_html_page)
-            ).group()
+            match = KWIK_PAGE_REGEX.search(pahewin_html_page)
+            if match is None:
+                raise InvalidDownloadResponse(
+                    "Animepahe download page is missing its host link. "
+                    "Retry later or choose another source."
+                )
+            kwik_page_link = match.group()
 
             # Extract direct download links from kwik html page
             response = CLIENT.get(kwik_page_link)
-            match = cast(re.Match, PARAM_REGEX.search(response.text))
+            match = PARAM_REGEX.search(response.text)
+            if match is None:
+                raise InvalidDownloadResponse(
+                    "Animepahe download host returned no form parameters. "
+                    "Retry later or choose another source."
+                )
             full_key, key, v1, v2 = (
                 match.group(1),
                 match.group(2),
