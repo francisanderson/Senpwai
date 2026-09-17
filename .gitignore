@@ -5,6 +5,7 @@
 .venv-termux
 tests/*
 !tests/test_pahe_size.py
+!tests/test_domain_alignment.py
 test-downloads/
 __pycache__/
 .ruff_cache/
