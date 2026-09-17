@@ -502,7 +502,7 @@ class ProgressBarWithoutButtons(QWidget):
         parent: QWidget | None,
         task_title: str,
         item_task_is_applied_on: str,
-        total_value: int,
+        total_value: int | None,
         units: str,
         units_divisor: int = 1,
         delete_on_completion=True,
@@ -510,6 +510,8 @@ class ProgressBarWithoutButtons(QWidget):
         super().__init__(parent)
         self.item_task_is_applied_on = item_task_is_applied_on
         self.total_value = total_value
+        self.current_value = 0
+        self.completed = False
         self.units = units
         self.units_divisor = units_divisor
         self.mutex = QMutex()
@@ -521,14 +523,14 @@ class ProgressBarWithoutButtons(QWidget):
 
         self.bar = QProgressBar(self)
         self.bar.setValue(0)
-        self.bar.setMaximum(total_value)
+        self.bar.setMaximum(total_value if total_value is not None else 0)
         self.task_title = task_title
         self.bar.setFormat(f"{task_title} {item_task_is_applied_on}")
         self.bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.bar.setStyleSheet(self.ongoing_stylesheet)
         height = 50
         self.percentage = OutlinedLabel(self, 1, 35)
-        self.percentage.setText("0 %")
+        self.percentage.setText("0 %" if total_value is not None else "?")
         self.percentage.setFixedHeight(height)
         self.percentage.setStyleSheet(self.text_style_sheet)
 
@@ -544,7 +546,7 @@ class ProgressBarWithoutButtons(QWidget):
 
         self.current_against_max_values = OutlinedLabel(self, 1, 40)
         self.current_against_max_values.setText(
-            f"0/{round(total_value / units_divisor)} {units}"
+            f"0/{round(total_value / units_divisor) if total_value is not None else '?'} {units}"
         )
         self.current_against_max_values.setFixedHeight(height)
         self.current_against_max_values.setStyleSheet(self.text_style_sheet)
@@ -560,7 +562,22 @@ class ProgressBarWithoutButtons(QWidget):
         QTimer(self).singleShot(40000, self.deleteLater)
 
     def is_complete(self) -> bool:
+        if self.total_value is None:
+            return self.completed
         return self.bar.value() >= self.total_value
+
+    def complete(self):
+        """Finish an unknown-total task from its owner's completion event."""
+        if self.cancelled or self.completed:
+            return
+        self.completed = True
+        self.bar.setRange(0, 1)
+        self.bar.setValue(1)
+        self.bar.setFormat(f"Completed {self.item_task_is_applied_on}")
+        self.bar.setStyleSheet(self.completed_stylesheet)
+        self.eta.setText("0 secs left")
+        if self.delete_on_completion:
+            self.delete_after_timer()
 
     def cancel(self):
         if not self.paused and not self.is_complete() and not self.cancelled:
@@ -581,6 +598,14 @@ class ProgressBarWithoutButtons(QWidget):
                 self.bar.setFormat(f"{self.task_title} {self.item_task_is_applied_on}")
 
     def update_bar(self, added_value: int):
+        if self.total_value is None:
+            if self.cancelled or self.completed:
+                return
+            self.current_value = max(0, self.current_value + added_value)
+            self.current_against_max_values.setText(
+                f" {round(self.current_value / self.units_divisor)}/? {self.units}"
+            )
+            return
         self.mutex.lock()
         curr_time = time.time()
         new_value = self.bar.value() + added_value

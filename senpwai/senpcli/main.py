@@ -367,10 +367,10 @@ def pahe_get_download_page_links(
     )
     total_download_size = pahe.calculate_total_download_size(down_info)
     pbar.close_()
-    size_text = add_color(
-        f"{total_download_size} MB{', go shower' if total_download_size >= 1000 else ''}",
-        Color.MAGENTA,
-    )
+    size_text = "unknown"
+    if total_download_size is not None:
+        size_text = f"{total_download_size} MB{', go shower' if total_download_size >= 1000 else ''}"
+    size_text = add_color(size_text, Color.MAGENTA)
     print_info(f"Total download size: {size_text}")
     return down_page_links
 
