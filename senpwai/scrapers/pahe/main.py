@@ -10,6 +10,7 @@ from senpwai.common.scraper import (
     DomainNameError,
     InvalidDownloadResponse,
     ProgressFunction,
+    raise_for_provider_verification,
     get_new_home_url_from_readme,
     closest_quality_index,
 )
@@ -361,8 +362,15 @@ class GetDirectDownloadLinks(ProgressFunction):
     ) -> list[str]:
         direct_download_links: list[str] = []
         for pahewin_link in pahewin_download_page_links:
+            if self.cancelled:
+                return []
             # Extract kwik page links
-            pahewin_html_page = CLIENT.get(pahewin_link).text
+            response = CLIENT.get(pahewin_link)
+            raise_for_provider_verification(response)
+            if self.cancelled:
+                response.close()
+                return []
+            pahewin_html_page = response.text
             match = KWIK_PAGE_REGEX.search(pahewin_html_page)
             if match is None:
                 raise InvalidDownloadResponse(
@@ -373,6 +381,10 @@ class GetDirectDownloadLinks(ProgressFunction):
 
             # Extract direct download links from kwik html page
             response = CLIENT.get(kwik_page_link)
+            raise_for_provider_verification(response)
+            if self.cancelled:
+                response.close()
+                return []
             match = PARAM_REGEX.search(response.text)
             if match is None:
                 raise InvalidDownloadResponse(
@@ -396,6 +408,7 @@ class GetDirectDownloadLinks(ProgressFunction):
                 data={"_token": token_value},
                 allow_redirects=False,
             )
+            raise_for_provider_verification(response)
             direct_download_link = response.headers["Location"]
             direct_download_links.append(direct_download_link)
             self.resume.wait()
