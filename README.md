@@ -159,6 +159,60 @@ More sources means more writing more code which in turn means fixing more bugs.
 -   [Inno Setup](https://jrsoftware.org/isinfo.php) is used for creating the installer, add the installation folder to the `%PATH%` environment variable for access to `ISCC.exe` from the command line. Also set the `SENPWAI_ROOT_DIR` environment variable to the root directory of the project.
 -   [Poe](https://github.com/nat-n/poethepoet) is used as the task runner, there are various tasks available to run e.g., `poe lint` to lint the code. It autoloads the `.env` file in the root directory of the project. Poe is installed when you setup the project.
 
+## Maintenance checks
+
+### Local setup
+
+Use Python 3.11, then install the locked development environment:
+
+```text
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r dev-requirements.txt
+poetry install
+```
+
+On POSIX shells, use `python3.11 -m venv .venv` and `. .venv/bin/activate` instead. On Ubuntu, install the Qt runtime libraries needed by the offscreen GUI tests: `libegl1 libgl1 libxkbcommon0`.
+
+### Offline checks (no provider requests)
+
+Run these before reviewing or merging a change:
+
+```text
+poetry run poe test_offline
+poetry run ruff check .
+poetry run python -m compileall -q senpwai scripts
+```
+
+The direct equivalents used in the fork checkout are:
+
+```text
+py -V:Astral/CPython3.11.15 -m unittest discover -s tests -v
+py -V:Astral/CPython3.11.15 -m ruff check . --output-format concise
+py -V:Astral/CPython3.11.15 -m compileall -q senpwai scripts
+```
+
+Offline tests use local HTTP servers, mocks, and fixtures; they do not contact Animepahe, Kwik, Gogo, or other providers.
+
+### Live smoke checks (network required)
+
+These tasks intentionally hit external providers and are separate from offline checks:
+
+```text
+poetry run poe test_pahe_dpl
+poetry run poe test_gogo_norm
+poetry run poe test_gogo_hls
+```
+
+`poetry run poe test` aggregates the live provider tasks. Do not use it as an offline test substitute. The workflow keeps the offline task in its own required job and runs the Pahe live smoke in a separate job; a live-provider failure remains visible and is not suppressed.
+
+### Current fork baseline
+
+At the time this maintenance slice was prepared, the offline suite passed **54 tests** and `compileall` passed. The first Ubuntu workflow run exposed a missing `libEGL.so.1` runtime dependency in the existing offscreen GUI tests; the workflow now installs the Qt runtime packages instead of skipping those tests. The required offline job then passed, while the separate Pahe live smoke failed on the external provider with `requests.exceptions.JSONDecodeError`; that failure remains visible and unsuppressed. Full Ruff was not clean locally: it reported four pre-existing findings in the untracked `tasks/probe_gogo.py` and `tasks/test_response_consumers.py` probes. They are recorded rather than suppressed or deleted. Poetry/Poe and the packaging commands were unavailable in the current shell, so release builds were not claimed as passing.
+
+
+
 ## Legal Disclaimer
 
 Senpwai is designed solely for providing access to publicly available content. It is not intended to support or promote piracy or copyright infringement. As the creator of this app, I hereby declare that I am not responsible for, and in no way associated with, any external links or the content they direct to.

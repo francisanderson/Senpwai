@@ -16,11 +16,16 @@ on:
         - cron: "0 6 * * *"
 
 jobs:
-    test:
+    offline:
         runs-on: ubuntu-latest
         timeout-minutes: 5
 
         steps:
+            - name: Install Qt runtime libraries
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install --no-install-recommends -y libegl1 libgl1 libxkbcommon0
+
             - name: Checkout repository
               uses: actions/checkout@v4
 
@@ -36,27 +41,43 @@ jobs:
                   pip install -r dev-requirements.txt
                   poetry install
 
-            - name: Lint
-              id: lint
-              continue-on-error: true
-              run: poetry run ruff .
+            - name: Offline tests
+              run: poetry run poe test_offline
 
-            - name: Test Pahe
+            - name: Lint
+              run: poetry run ruff check .
+
+    live-smoke:
+        needs: offline
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+
+        steps:
+            - name: Install Qt runtime libraries
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install --no-install-recommends -y libegl1 libgl1 libxkbcommon0
+
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Set up Python
+              uses: actions/setup-python@v4
+              with:
+                  python-version: "3.11"
+
+            - name: Install dependencies
+              run: |
+
+                  python -m pip install --upgrade pip
+                  pip install -r dev-requirements.txt
+                  poetry install
+
+            - name: Pahe live provider smoke
               id: test_pahe
-              continue-on-error: true
               run: poetry run poe test_pahe_dpl
 
-            - name: Check results
+            - name: Record live smoke outcome
+              if: ${{ always() }}
               run: |
-                  failed=false
-                  if [ ${{ steps.lint.outcome }} == "failure" ]; then
-                    echo "Lint failed"
-                    failed=true
-                  fi
-                  if [ ${{ steps.test_pahe.outcome }} == "failure" ]; then
-                    echo "Test Pahe failed"
-                    failed=true
-                  fi
-                  if [ $failed  = true ]; then
-                    exit 1
-                  fi
+                  echo "Pahe live smoke outcome: ${{ steps.test_pahe.outcome }}"
