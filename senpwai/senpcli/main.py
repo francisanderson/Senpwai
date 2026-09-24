@@ -306,6 +306,11 @@ def search(title: str, site: str) -> Anime | None:
 def validate_start_and_end_episode(
     start_episode: int, end_episode: int, total_episode_count: int
 ) -> tuple[int, int]:
+    if total_episode_count <= 0:
+        raise InvalidDownloadResponse(
+            "The selected site reports no available episodes. "
+            "Retry later or choose another source."
+        )
     if end_episode == -1:
         end_episode = total_episode_count
     if start_episode == -1:
@@ -334,16 +339,17 @@ def pahe_get_episode_page_links(
         desc="Getting episode page links",
         unit="eps",
     )
-    results = pahe.GetEpisodePageLinks().get_episode_page_links(
-        start_episode,
-        end_episode,
-        episode_pages_info,
-        anime_page_link,
-        anime_id,
-        pbar.update_,
-    )
-    pbar.close_()
-    return results
+    try:
+        return pahe.GetEpisodePageLinks().get_episode_page_links(
+            start_episode,
+            end_episode,
+            episode_pages_info,
+            anime_page_link,
+            anime_id,
+            pbar.update_,
+        )
+    finally:
+        pbar.close_()
 
 
 def pahe_get_download_page_links(

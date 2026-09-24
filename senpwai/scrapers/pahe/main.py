@@ -92,12 +92,39 @@ class EpisodePagesInfo(NamedTuple):
     first_page_json: dict[str, Any]
 
 
+def _episode_data(page_json: Any) -> list[dict[str, Any]]:
+    data = page_json.get("data") if isinstance(page_json, dict) else None
+    if not isinstance(data, list) or not data or any(
+        not isinstance(ep, dict)
+        or type(ep.get("episode")) not in (int, float)
+        or (
+            isinstance(ep["episode"], int)
+            and (
+                not isinstance(ep.get("session"), str)
+                or not ep["session"].strip()
+            )
+        )
+        for ep in data
+    ):
+        raise InvalidDownloadResponse(
+            "Animepahe returned missing, empty, or invalid episode data. "
+            "Retry later or choose another source."
+        )
+    return data
+
+
 def get_episode_pages_info(
     anime_page_link: str, start_episode: int, end_episode: int
 ) -> EpisodePagesInfo:
     page_url = LOAD_EPISODES_URL.format(anime_page_link, 1)
     first_page_json = site_request(page_url).json()
-    per_page: int = first_page_json["per_page"]
+    _episode_data(first_page_json)
+    per_page = first_page_json.get("per_page")
+    if not isinstance(per_page, int) or isinstance(per_page, bool) or per_page <= 0:
+        raise InvalidDownloadResponse(
+            "Animepahe returned invalid episode pagination. "
+            "Retry later or choose another source."
+        )
     start_page_num = math.ceil(start_episode / per_page)
     end_page_num = math.ceil(end_episode / per_page)
     total = (end_page_num - start_page_num) + 1
@@ -158,29 +185,35 @@ class GetEpisodePageLinks(ProgressFunction):
             first_page_json,
         ) = episode_pages_info
 
+        first_page_data = _episode_data(first_page_json)
+        first_episode_json = next(
+            (ep for ep in first_page_data if isinstance(ep["episode"], int)), None
+        )
+        if first_episode_json is None:
+            raise InvalidDownloadResponse(
+                "Animepahe returned no numbered episodes. "
+                "Retry later or choose another source."
+            )
         episodes_data: list[dict[str, Any]] = []
         if start_page_num == 1:
-            episodes_data.extend(first_page_json["data"])
+            episodes_data.extend(
+                ep for ep in first_page_data if isinstance(ep["episode"], int)
+            )
             start_page_num += 1
             if progress_update_callback:
                 progress_update_callback(1)
         for page_num in range(start_page_num, end_page_num + 1):
             page_url = LOAD_EPISODES_URL.format(anime_page_link, page_num)
             page_json = site_request(page_url).json()
+            page_data = _episode_data(page_json)
             # To avoid episodes like 7.5 and 5.5 cause they're usually just recaps
-            episodes = [
-                ep for ep in page_json["data"] if isinstance(ep["episode"], int)
-            ]
+            episodes = [ep for ep in page_data if isinstance(ep["episode"], int)]
             episodes_data.extend(episodes)
-            page_url = page_json["next_page_url"]
             self.resume.wait()
             if self.cancelled:
                 return []
             if progress_update_callback:
                 progress_update_callback(1)
-        first_episode_json = next(
-            ep for ep in first_page_json["data"] if isinstance(ep["episode"], int)
-        )
         first_episode = first_episode_json["episode"]
         return GetEpisodePageLinks.generate_episode_page_links(
             start_episode,
