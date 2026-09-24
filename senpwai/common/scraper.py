@@ -20,9 +20,23 @@ PARSER = "html.parser"
 IBYTES_TO_MBS_DIVISOR = 1024 * 1024
 QUALITY_REGEX_1 = re.compile(r"\b(\d{3,4})p\b")
 QUALITY_REGEX_2 = re.compile(r"\b\d+x(\d+)\b")
-NETWORK_RETRY_WAIT_TIME = 5
+NETWORK_RETRY_LIMIT = 3
+NETWORK_RETRY_WAIT_TIME = 1
 GITHUB_API_README_URL = "https://api.github.com/repos/SenZmaKi/Senpwai/readme"
 RESOURCE_MOVED_STATUS_CODES = (301, 302, 307, 308)
+VERIFICATION_STATUS_CODES = frozenset((403, 429))
+VERIFICATION_BODY_MARKERS = (
+    "just a moment",
+    "checking your browser",
+    "cf-chl-",
+    "challenge-platform",
+)
+VERIFICATION_BODY_PREFIX_BYTES = 4096
+VERIFICATION_MESSAGE = (
+    "Provider blocked the request or requires verification. "
+    "Open the provider in a browser, complete any verification, then retry. "
+    "Senpwai will not bypass access controls."
+)
 
 FFMPEG_WINDOWS_INSTALLATION_GUIDE = "https://www.hostinger.com/tutorials/how-to-install-ffmpeg#How_to_Install_FFmpeg_on_Windows"
 FFMPEG_LINUX_INSTALLATION_GUIDE = "https://www.hostinger.com/tutorials/how-to-install-ffmpeg#How_to_Install_FFmpeg_on_Linux"
@@ -85,6 +99,52 @@ USER_AGENTS = (
 
 class InvalidDownloadResponse(Exception):
     """The server did not return a usable download response."""
+
+
+def _verification_body_prefix(response: requests.Response) -> str:
+    raw = getattr(response, "raw", None)
+    if isinstance(response, requests.Response):
+        body = getattr(response, "_content", b"")
+        if isinstance(body, (bytes, bytearray)):
+            return bytes(body[:VERIFICATION_BODY_PREFIX_BYTES]).decode("utf-8", errors="ignore")
+        read = getattr(raw, "read", None)
+        if callable(read):
+            try:
+                body = read(VERIFICATION_BODY_PREFIX_BYTES)
+            except Exception:
+                body = b""
+            if isinstance(body, (bytes, bytearray)):
+                encoding = getattr(response, "encoding", None)
+                return bytes(body[:VERIFICATION_BODY_PREFIX_BYTES]).decode(
+                    encoding if isinstance(encoding, str) else "utf-8", errors="ignore"
+                )
+            if isinstance(body, str):
+                return body[:VERIFICATION_BODY_PREFIX_BYTES]
+        return ""
+    body = getattr(response, "content", b"")
+    if isinstance(body, (bytes, bytearray)):
+        return bytes(body[:VERIFICATION_BODY_PREFIX_BYTES]).decode("utf-8", errors="ignore")
+    text = getattr(response, "text", "")
+    return text[:VERIFICATION_BODY_PREFIX_BYTES] if isinstance(text, str) else ""
+
+
+def is_provider_verification_response(response: requests.Response) -> bool:
+    if getattr(response, "status_code", None) in VERIFICATION_STATUS_CODES:
+        return True
+    headers = getattr(response, "headers", {})
+    content_type = headers.get("Content-Type", "") if hasattr(headers, "get") else ""
+    if "text/html" not in str(content_type).lower():
+        return False
+    body = _verification_body_prefix(response).lower()
+    return any(marker in body for marker in VERIFICATION_BODY_MARKERS)
+
+
+def raise_for_provider_verification(response: requests.Response) -> None:
+    if is_provider_verification_response(response):
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+        raise InvalidDownloadResponse(VERIFICATION_MESSAGE)
 
 
 class NoResourceLengthException(InvalidDownloadResponse):
@@ -228,6 +288,7 @@ class Client:
         callback: Callable[[], T],
         exceptions_to_raise: tuple[type[BaseException], ...] = (KeyboardInterrupt,),
     ) -> T:
+        retry_count = 0
         while True:
             try:
                 return callback()
@@ -243,8 +304,11 @@ class Client:
                     [isinstance(e, exception) for exception in exceptions_to_raise]
                 ):
                     raise e
+                if retry_count >= NETWORK_RETRY_LIMIT:
+                    raise
                 log_exception(e)
-                time.sleep(1)
+                retry_count += 1
+                time.sleep(NETWORK_RETRY_WAIT_TIME)
 
 
 CLIENT = Client()
@@ -413,8 +477,8 @@ class ProgressFunction:
         self.resume.set()
 
     def cancel(self):
-        if self.resume.is_set():
-            self.cancelled = True
+        self.cancelled = True
+        self.resume.set()
 
 
 class Download(ProgressFunction):
@@ -449,6 +513,7 @@ class Download(ProgressFunction):
 
     @staticmethod
     def validate_response(response: requests.Response) -> None:
+        raise_for_provider_verification(response)
         content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if not 200 <= response.status_code < 300 or content_type in (
             "text/html", "application/xhtml+xml", "application/json",

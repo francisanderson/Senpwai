@@ -80,15 +80,24 @@ class LocalTransferTests(unittest.TestCase):
     def setUpClass(cls):
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                body = b"<html>error</html>" if self.path == "/html" else b"media"
+                status = 404 if self.path == "/error" else 200
+                if self.path == "/html":
+                    body = b"<html>error</html>"
+                elif self.path == "/blocked":
+                    body = b"<html>Access denied</html>"
+                    status = 403
+                elif self.path == "/challenge":
+                    body = b"<html>Checking your browser</html>"
+                else:
+                    body = b"media"
                 if self.path == "/range":
                     start, end = map(int, self.headers["Range"].removeprefix("bytes=").split("-"))
                     body = b"0123456789"[start:end + 1]
-                    self.send_response(206)
+                    status = 206
+                self.send_response(status)
+                if self.path == "/range":
                     self.send_header("Content-Range", f"bytes {start}-{end}/10")
-                else:
-                    self.send_response(404 if self.path == "/error" else 200)
-                self.send_header("Content-Type", "text/html" if self.path == "/html" else "video/mp4")
+                self.send_header("Content-Type", "text/html" if self.path in ("/html", "/blocked", "/challenge") else "video/mp4")
                 if self.path != "/missing":
                     self.send_header("Content-Length", "100" if self.path == "/short" else str(len(body)))
                 self.end_headers()
@@ -114,6 +123,13 @@ class LocalTransferTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(InvalidDownloadResponse):
                 Download.get_total_download_size(self.base + path)
         self.assertEqual(Download.get_total_download_size(self.base + "/valid")[0], 5)
+
+    def test_local_verification_fixtures_are_actionable(self):
+        for path in ("/blocked", "/challenge"):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                InvalidDownloadResponse, "verification|browser|retry"
+            ):
+                Download.get_total_download_size(self.base + path)
 
     def test_valid_single_and_multipart_downloads(self):
         for path, size, part_size, expected in (
@@ -596,6 +612,151 @@ class PaheEpisodeConsumerTests(unittest.TestCase):
         queued.assert_called_once_with(details, ["episode1", "episode2"])
         bar.cancel.assert_not_called()
         notice.assert_not_called()
+
+
+
+
+class ProviderVerificationTests(unittest.TestCase):
+    @staticmethod
+    def blocked_response(status=403, body="<html>Access denied</html>"):
+        result = Mock()
+        result.status_code = status
+        result.headers = {"Content-Type": "text/html; charset=utf-8"}
+        result.text = body
+        return result
+
+    def test_blocked_status_is_actionable_only_at_opt_in_boundaries(self):
+        from senpwai.common import scraper
+
+        blocked = self.blocked_response()
+        with patch.object(scraper.requests, "get", return_value=blocked) as get:
+            self.assertIs(
+                scraper.Client().get("https://fixture.invalid/blocked"), blocked
+            )
+        get.assert_called_once()
+        with self.assertRaisesRegex(InvalidDownloadResponse, "verification|browser|retry"):
+            scraper.raise_for_provider_verification(blocked)
+        blocked.close.assert_called_once()
+
+    def test_challenge_html_is_actionable_at_download_validation(self):
+        from senpwai.common import scraper
+
+        challenge = self.blocked_response(
+            status=200,
+            body="<html><title>Just a moment...</title><div>Checking your browser</div></html>",
+        )
+        with self.assertRaisesRegex(InvalidDownloadResponse, "verification|browser|retry"):
+            scraper.Download.validate_response(challenge)
+
+    def test_streamed_challenge_inspection_reads_only_bounded_prefix(self):
+        from senpwai.common import scraper
+        import requests
+
+        streamed = requests.Response()
+        streamed.status_code = 200
+        streamed.headers["Content-Type"] = "text/html"
+        streamed.encoding = "utf-8"
+        streamed.raw = Mock()
+        streamed.raw.read.return_value = b"Checking your browser" + b"x" * 10000
+        with self.assertRaisesRegex(InvalidDownloadResponse, "verification|browser|retry"):
+            scraper.Download.validate_response(streamed)
+        streamed.raw.read.assert_called_once_with(scraper.VERIFICATION_BODY_PREFIX_BYTES)
+
+    def test_challenge_marker_is_detected_without_rejecting_ordinary_html(self):
+        from senpwai.common import scraper
+
+        challenge = self.blocked_response(
+            status=200, body="<html>Checking your browser before continuing</html>"
+        )
+        with self.assertRaisesRegex(InvalidDownloadResponse, "verification|browser|retry"):
+            scraper.raise_for_provider_verification(challenge)
+
+        ordinary = self.blocked_response(
+            status=200,
+            body="<html>Login form with g-recaptcha and a captcha widget</html>",
+        )
+        with patch.object(scraper.requests, "get", return_value=ordinary):
+            self.assertIs(
+                scraper.Client().get("https://fixture.invalid/ordinary"), ordinary
+            )
+
+    def test_pahe_direct_link_propagates_supported_action(self):
+        from senpwai.common import scraper
+        from senpwai.scrapers.pahe.main import GetDirectDownloadLinks
+
+        blocked = self.blocked_response(status=429)
+        with patch.object(scraper.requests, "get", return_value=blocked):
+            with self.assertRaisesRegex(InvalidDownloadResponse, "verification|browser|retry"):
+                GetDirectDownloadLinks().get_direct_download_links(["page"])
+
+    def test_pahe_real_nonstream_challenge_response_is_actionable(self):
+        from senpwai.common import scraper
+        from senpwai.scrapers.pahe.main import GetDirectDownloadLinks
+        import requests
+
+        challenge = requests.Response()
+        challenge.status_code = 200
+        challenge.headers["Content-Type"] = "text/html"
+        challenge.encoding = "utf-8"
+        challenge._content = b"<html>Checking your browser</html>"
+        challenge.close = Mock()
+        with patch.object(scraper.requests, "get", return_value=challenge) as get:
+            with self.assertRaisesRegex(InvalidDownloadResponse, "verification|browser|retry"):
+                GetDirectDownloadLinks().get_direct_download_links(["page"])
+        get.assert_called_once()
+        challenge.close.assert_called_once()
+
+    def test_cancelled_direct_link_does_not_start_a_request(self):
+        from senpwai.common import scraper
+        from senpwai.scrapers.pahe.main import GetDirectDownloadLinks
+
+        collector = GetDirectDownloadLinks()
+        collector.cancel()
+        with patch.object(scraper.requests, "get") as get:
+            self.assertEqual(collector.get_direct_download_links(["page"]), [])
+        get.assert_not_called()
+
+    def test_cancellation_between_pahe_requests_stops_before_next_request(self):
+        from senpwai.common import scraper
+        from senpwai.scrapers.pahe.main import GetDirectDownloadLinks
+
+        collector = GetDirectDownloadLinks()
+        first_response = SimpleNamespace(
+            status_code=200,
+            headers={"Content-Type": "text/html"},
+            text="https://kwik.cx/f/fixture",
+            close=Mock(),
+        )
+
+        def first_get(*_args, **_kwargs):
+            collector.cancel()
+            return first_response
+
+        with patch.object(scraper.requests, "get", side_effect=first_get) as get:
+            self.assertEqual(collector.get_direct_download_links(["page"]), [])
+        get.assert_called_once()
+
+    def test_network_errors_stop_after_bounded_retries(self):
+        from senpwai.common import scraper
+        import requests
+
+        timeout = requests.exceptions.Timeout("fixture timeout")
+        with patch.object(scraper.requests, "get", side_effect=[timeout] * 10) as get, patch.object(
+            scraper.time, "sleep"
+        ) as sleep, patch.object(scraper, "log_exception"):
+            with self.assertRaises(requests.exceptions.Timeout):
+                scraper.Client().get("https://fixture.invalid/retry")
+        self.assertEqual(get.call_count, 4)
+        self.assertEqual(sleep.call_count, 3)
+
+    def test_cancelling_paused_progress_wakes_waiters(self):
+        from senpwai.common import scraper
+
+        progress = scraper.ProgressFunction()
+        progress.pause_or_resume()
+        progress.cancel()
+        self.assertTrue(progress.cancelled)
+        self.assertTrue(progress.resume.is_set())
 
 
 if __name__ == "__main__":
