@@ -1026,6 +1026,7 @@ class GogoGetDownloadPageLinksThread(QThread):
 
 class PaheGetEpisodePageInfo(QThread):
     finished = pyqtSignal(AnimeDetails, pahe.EpisodePagesInfo)
+    failed = pyqtSignal(str)
 
     def __init__(
         self,
@@ -1036,27 +1037,38 @@ class PaheGetEpisodePageInfo(QThread):
         finished_callback: Callable[[AnimeDetails, pahe.EpisodePagesInfo], None],
     ):
         super().__init__(download_window)
+        self.download_window = download_window
         self.start_episode = start_episode
         self.end_episode = end_episode
         self.anime_details = anime_details
         self.finished.connect(finished_callback)
+        self.failed.connect(self.handle_failure)
+
+    @pyqtSlot(str)
+    def handle_failure(self, message: str):
+        self.download_window.main_window.tray_icon.make_notification(
+            "Download failed", message, False, None
+        )
 
     def run(self):
-        self.finished.emit(
-            self.anime_details,
-            pahe.get_episode_pages_info(
+        try:
+            episode_pages_info = pahe.get_episode_pages_info(
                 self.anime_details.anime.page_link, self.start_episode, self.end_episode
-            ),
-        )
+            )
+        except InvalidDownloadResponse as error:
+            self.failed.emit(f"{self.anime_details.sanitised_title}: {error}")
+            return
+        self.finished.emit(self.anime_details, episode_pages_info)
 
 
 class PaheGetEpisodePageLinksThread(QThread):
     finished = pyqtSignal(AnimeDetails, list)
+    failed = pyqtSignal(str)
     update_bar = pyqtSignal(int)
 
     def __init__(
         self,
-        parent,
+        download_window: DownloadWindow,
         anime_details: AnimeDetails,
         start_episode: int,
         end_episode: int,
@@ -1064,27 +1076,42 @@ class PaheGetEpisodePageLinksThread(QThread):
         finished_callback: Callable[[AnimeDetails, list[str]], None],
         progress_bar: ProgressBarWithButtons,
     ):
-        super().__init__(parent)
+        super().__init__(download_window)
+        self.download_window = download_window
         self.anime_details = anime_details
         self.finished.connect(finished_callback)
+        self.failed.connect(self.handle_failure)
         self.start_episode = start_episode
         self.episode_pages_info = episode_pages_info
         self.end_episode = end_episode
         self.progress_bar = progress_bar
         self.update_bar.connect(progress_bar.update_bar)
 
+    @pyqtSlot(str)
+    def handle_failure(self, message: str):
+        self.download_window.main_window.tray_icon.make_notification(
+            "Download failed", message, False, None
+        )
+        if self.progress_bar.paused:
+            self.progress_bar.pause_or_resume()
+        self.progress_bar.cancel()
+
     def run(self):
         obj = pahe.GetEpisodePageLinks()
         self.progress_bar.pause_callback = obj.pause_or_resume
         self.progress_bar.cancel_callback = obj.cancel
-        episode_page_links = obj.get_episode_page_links(
-            self.start_episode,
-            self.end_episode,
-            self.episode_pages_info,
-            self.anime_details.anime.page_link,
-            cast(str, self.anime_details.anime.id),
-            lambda x: self.update_bar.emit(x),
-        )
+        try:
+            episode_page_links = obj.get_episode_page_links(
+                self.start_episode,
+                self.end_episode,
+                self.episode_pages_info,
+                self.anime_details.anime.page_link,
+                cast(str, self.anime_details.anime.id),
+                lambda x: self.update_bar.emit(x),
+            )
+        except InvalidDownloadResponse as error:
+            self.failed.emit(f"{self.anime_details.sanitised_title}: {error}")
+            return
         if not obj.cancelled:
             self.finished.emit(self.anime_details, episode_page_links)
 

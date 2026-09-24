@@ -364,5 +364,239 @@ class PaheLinkResponseTests(unittest.TestCase):
         progress.assert_called_with(1)
 
 
+class PaheEpisodeResponseTests(unittest.TestCase):
+    def test_missing_empty_or_invalid_episode_data_is_explicit(self):
+        from senpwai.scrapers.pahe import main as pahe
+
+        for data in ({}, {"data": []}, {"data": None}, {"data": {}},
+                     {"data": [None]}, {"data": [{"episode": 1}]},
+                     {"data": [{"episode": 1, "session": ""}]}):
+            with self.subTest(data=data), patch.object(pahe, "site_request", return_value=Mock(
+                json=Mock(return_value={"per_page": 30, **data})
+            )):
+                with self.assertRaisesRegex(InvalidDownloadResponse, "Animepahe.*episode.*[Rr]etry"):
+                    pahe.get_episode_pages_info("fixture", 1, 1)
+
+    def test_invalid_pagination_is_explicit(self):
+        from senpwai.scrapers.pahe import main as pahe
+
+        for per_page in (None, 0, -1, "30", True):
+            page = {"data": [{"episode": 1, "session": "one"}], "per_page": per_page}
+            with self.subTest(per_page=per_page), patch.object(pahe, "site_request", return_value=Mock(
+                json=Mock(return_value=page)
+            )):
+                with self.assertRaisesRegex(InvalidDownloadResponse, "Animepahe.*pagination.*[Rr]etry"):
+                    pahe.get_episode_pages_info("fixture", 1, 1)
+
+    def test_missing_later_page_data_aborts_collection(self):
+        from senpwai.scrapers.pahe import main as pahe
+
+        first = {"data": [{"episode": 1, "session": "one"}], "per_page": 1}
+        progress = Mock()
+        with patch.object(pahe, "site_request", return_value=Mock(json=Mock(return_value={}))) as request:
+            with self.assertRaisesRegex(InvalidDownloadResponse, "Animepahe.*episode.*[Rr]etry"):
+                pahe.GetEpisodePageLinks().get_episode_page_links(
+                    1, 2, pahe.EpisodePagesInfo(1, 2, 2, first), "fixture", "anime", progress
+                )
+        request.assert_called_once()
+        progress.assert_called_once_with(1)
+
+    def test_first_page_without_integer_episode_is_explicit(self):
+        from senpwai.scrapers.pahe import main as pahe
+
+        first = {"data": [{"episode": 1.5}], "per_page": 30}
+        with self.assertRaisesRegex(InvalidDownloadResponse, "Animepahe.*episode.*[Rr]etry"):
+            pahe.GetEpisodePageLinks().get_episode_page_links(
+                1, 1, pahe.EpisodePagesInfo(1, 1, 1, first), "fixture", "anime"
+            )
+
+    def test_valid_pages_preserve_sequel_offsets_order_and_progress(self):
+        from senpwai.scrapers.pahe import main as pahe
+
+        first = {"data": [{"episode": 14, "session": "one"},
+                          {"episode": 14.25}], "per_page": 1}
+        second = {"data": [{"episode": 14.5},
+                           {"episode": 15, "session": "two"}]}
+        progress = Mock()
+        with patch.object(pahe, "site_request", side_effect=[
+            Mock(json=Mock(return_value=first)), Mock(json=Mock(return_value=second))
+        ]):
+            info = pahe.get_episode_pages_info("fixture", 1, 2)
+            links = pahe.GetEpisodePageLinks().get_episode_page_links(1, 2, info, "fixture", "anime", progress)
+        self.assertEqual(links, [pahe.EPISODE_PAGE_URL.format("anime", session) for session in ("one", "two")])
+        self.assertEqual(progress.call_args_list, [unittest.mock.call(1), unittest.mock.call(1)])
+
+
+
+
+class PaheEpisodeConsumerTests(unittest.TestCase):
+    def test_cli_rejects_nonpositive_totals_before_clamping_episode_range(self):
+        warn = Mock()
+        validate = load_node("senpcli/main.py", "validate_start_and_end_episode", dict(
+            InvalidDownloadResponse=InvalidDownloadResponse, print_warn=warn,
+        ))
+        for total in (0, -1):
+            for start, end in ((1, -1), (-1, -1), (1, 5)):
+                with self.subTest(total=total, start=start, end=end):
+                    with self.assertRaisesRegex(InvalidDownloadResponse, "[Ee]pisodes.*[Rr]etry"):
+                        validate(start, end, total)
+        warn.assert_not_called()
+
+    def test_cli_valid_total_preserves_episode_range_defaults(self):
+        validate = load_node("senpcli/main.py", "validate_start_and_end_episode", dict(
+            InvalidDownloadResponse=InvalidDownloadResponse, print_warn=Mock(),
+        ))
+        self.assertEqual(validate(1, -1, 12), (1, 12))
+        self.assertEqual(validate(-1, -1, 12), (12, 12))
+        self.assertEqual(validate(1, 15, 12), (1, 12))
+
+    def test_cli_episode_links_bar_closes_on_failure_and_success(self):
+        for fails in (True, False):
+            with self.subTest(fails=fails):
+                bar, collector = Mock(), Mock()
+                error = InvalidDownloadResponse("Animepahe episode response invalid. Retry later or choose another source.")
+                collector.get_episode_page_links.side_effect = error if fails else None
+                collector.get_episode_page_links.return_value = ["episode1", "episode2"]
+                info = SimpleNamespace(total=1)
+                provider = SimpleNamespace(
+                    get_episode_pages_info=Mock(return_value=info),
+                    GetEpisodePageLinks=lambda: collector,
+                )
+                retrieve = load_node("senpcli/main.py", "pahe_get_episode_page_links", dict(
+                    pahe=provider, ProgressBar=Mock(return_value=bar),
+                ))
+                if fails:
+                    with self.assertRaises(InvalidDownloadResponse):
+                        retrieve(1, 2, "id", "page")
+                else:
+                    self.assertEqual(retrieve(1, 2, "id", "page"), ["episode1", "episode2"])
+                bar.close_.assert_called_once()
+
+    def test_cli_main_reports_episode_retrieval_errors_without_traceback(self):
+        for stage in ("metadata", "links"):
+            with self.subTest(stage=stage):
+                error = InvalidDownloadResponse("Animepahe episode response invalid. Retry later or choose another source.")
+                provider = SimpleNamespace(
+                    get_episode_pages_info=Mock(
+                        side_effect=error if stage == "metadata" else None,
+                        return_value=SimpleNamespace(total=1),
+                    ),
+                    GetEpisodePageLinks=lambda: SimpleNamespace(
+                        get_episode_page_links=Mock(side_effect=error)
+                    ),
+                )
+                bars = Mock()
+                retrieve = load_node("senpcli/main.py", "pahe_get_episode_page_links", dict(
+                    pahe=provider, ProgressBar=bars,
+                ))
+                parsed = SimpleNamespace(
+                    config=False, update=False, check_tracked_anime=False,
+                    remove_tracked_anime=False, add_tracked_anime=False, title="Example",
+                )
+                report, finish = Mock(), Mock()
+                main = load_node("senpcli/main.py", "main", dict(
+                    sys=SimpleNamespace(argv=["senpcli"]), ASCII_APP_NAME="", print_rainbow=Mock(),
+                    parse_args=lambda _: (parsed, None), validate_args=lambda _: True,
+                    start_update_check_thread=lambda: (), get_anime_details=lambda _: object(),
+                    initiate_download_pipeline=lambda *_: retrieve(1, 2, "id", "page"),
+                    finish_update_check=finish, print_error=report, ProgressBar=bars,
+                    InvalidDownloadResponse=InvalidDownloadResponse, AnimeDetails=object,
+                ))
+                main()
+                report.assert_called_once_with(f"Download failed: {error}")
+                bars.cancel_all_active.assert_called_once()
+                finish.assert_not_called()
+
+    def _gui_type(self, name, provider):
+        from typing import Callable, cast
+        from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot
+
+        return load_node("windows/download.py", name, dict(
+            QThread=QThread, pyqtSignal=pyqtSignal, pyqtSlot=pyqtSlot,
+            AnimeDetails=object, DownloadWindow=object, ProgressBarWithButtons=object,
+            Callable=Callable, cast=cast, pahe=provider,
+            InvalidDownloadResponse=InvalidDownloadResponse,
+        ))
+
+    def _gui_fixture(self):
+        from PyQt6.QtCore import QObject
+        from PyQt6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        parent = QObject()
+        notice = Mock()
+        parent.main_window = SimpleNamespace(
+            tray_icon=SimpleNamespace(make_notification=notice)
+        )
+        details = SimpleNamespace(
+            sanitised_title="Example",
+            anime=SimpleNamespace(page_link="page", id="id"),
+        )
+        return app, parent, details, notice
+
+    def test_gui_episode_info_failure_notifies_without_success(self):
+        app, parent, details, notice = self._gui_fixture()
+        error = InvalidDownloadResponse("Animepahe episode response invalid. Retry later or choose another source.")
+        provider = SimpleNamespace(EpisodePagesInfo=object, get_episode_pages_info=Mock(side_effect=error))
+        queued = Mock()
+        thread = self._gui_type("PaheGetEpisodePageInfo", provider)(parent, 1, 2, details, queued)
+        thread.run()
+        app.processEvents()
+        notice.assert_called_once_with("Download failed", f"Example: {error}", False, None)
+        queued.assert_not_called()
+
+    def test_gui_episode_links_failure_resumes_before_cancel_and_never_advances(self):
+        for paused in (True, False):
+            with self.subTest(paused=paused):
+                app, parent, details, notice = self._gui_fixture()
+                error = InvalidDownloadResponse("Animepahe episode response invalid. Retry later or choose another source.")
+                collector = Mock(cancelled=False)
+                collector.get_episode_page_links.side_effect = error
+                provider = SimpleNamespace(EpisodePagesInfo=object, GetEpisodePageLinks=lambda: collector)
+                queued, bar = Mock(), Mock(paused=paused)
+
+                def resume_bar():
+                    bar.paused = False
+                    bar.pause_callback()
+
+                bar.pause_or_resume.side_effect = resume_bar
+                bar.cancel.side_effect = lambda: bar.cancel_callback() if not bar.paused else None
+                thread = self._gui_type("PaheGetEpisodePageLinksThread", provider)(
+                    parent, details, 1, 2, object(), queued, bar
+                )
+                thread.run()
+                app.processEvents()
+                notice.assert_called_once_with("Download failed", f"Example: {error}", False, None)
+                self.assertEqual(bar.pause_or_resume.call_count, int(paused))
+                self.assertEqual(collector.pause_or_resume.call_count, int(paused))
+                self.assertFalse(bar.paused)
+                bar.cancel.assert_called_once()
+                collector.cancel.assert_called_once()
+                queued.assert_not_called()
+
+    def test_gui_episode_consumers_preserve_valid_success(self):
+        app, parent, details, notice = self._gui_fixture()
+        info = object()
+        provider = SimpleNamespace(EpisodePagesInfo=object, get_episode_pages_info=Mock(return_value=info))
+        queued = Mock()
+        thread = self._gui_type("PaheGetEpisodePageInfo", provider)(parent, 1, 2, details, queued)
+        thread.run()
+        app.processEvents()
+        queued.assert_called_once_with(details, info)
+
+        collector = Mock(cancelled=False)
+        collector.get_episode_page_links.return_value = ["episode1", "episode2"]
+        provider.GetEpisodePageLinks = lambda: collector
+        queued, bar = Mock(), Mock(paused=False)
+        thread = self._gui_type("PaheGetEpisodePageLinksThread", provider)(
+            parent, details, 1, 2, info, queued, bar
+        )
+        thread.run()
+        app.processEvents()
+        queued.assert_called_once_with(details, ["episode1", "episode2"])
+        bar.cancel.assert_not_called()
+        notice.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
