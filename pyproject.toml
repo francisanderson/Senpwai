@@ -92,6 +92,7 @@ build_release = [
     { ref = "run_pip_exes" },
     { ref = "make_portables" },
 ]
+test_offline = "python -m unittest discover -s tests -v"
 test = [{ ref = "test_pahe" }, { ref = "test_gogo" }]
 test_pahe = "python -m senpwai.scrapers.test --site pahe all"
 test_gogo = [{ ref = "test_gogo_norm" }, { ref = "test_gogo_hls" }]
