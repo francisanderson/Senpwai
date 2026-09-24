@@ -1,6 +1,7 @@
 import math
 from typing import Any, Callable, NamedTuple, cast
 from requests import Response
+from requests.exceptions import RequestException
 from bs4 import BeautifulSoup, Tag
 from senpwai.common.scraper import (
     CLIENT,
@@ -30,6 +31,7 @@ from senpwai.scrapers.pahe.constants import (
 )
 
 FIRST_REQUEST = True
+SEARCH_TIMEOUT = 30
 COOKIES = {"__ddg1_": "", "__ddg2_": ""}
 """
 For some reason these cookies just need to be set as in they don't even need to be valid
@@ -42,7 +44,7 @@ Also it seems currently only __ddg2_ is necessary
 """
 
 
-def site_request(url: str, allow_redirects=False) -> Response:
+def site_request(url: str, allow_redirects=False, timeout=None) -> Response:
     """
     For requests that go specifically to the domain animepahe.ru instead of e.g., pahe.win or kwik.si
     Typically these requests need the cookies
@@ -57,24 +59,47 @@ def site_request(url: str, allow_redirects=False) -> Response:
                 url,
                 cookies=COOKIES,
                 allow_redirects=allow_redirects,
+                timeout=timeout,
                 exceptions_to_raise=(DomainNameError, KeyboardInterrupt),
             )
         else:
-            response = CLIENT.get(url, cookies=COOKIES, allow_redirects=allow_redirects)
+            response = CLIENT.get(
+                url, cookies=COOKIES, allow_redirects=allow_redirects, timeout=timeout
+            )
         COOKIES.update(response.cookies)
     except DomainNameError:
         global PAHE_HOME_URL
         PAHE_HOME_URL = get_new_home_url_from_readme(FULL_SITE_NAME)
-        return site_request(url)
+        return site_request(url, allow_redirects=allow_redirects, timeout=timeout)
     return response
 
 
 def search(keyword: str) -> list[dict[str, str]]:
     search_url = f"{API_ENTRY_POINT}search&q={keyword}"
-    response = site_request(search_url)
-    results_json = cast(dict, response.json())
-    # The search api endpoint won't return json containing the data key if no results are found
-    return results_json.get("data", [])
+    try:
+        response = site_request(search_url, timeout=SEARCH_TIMEOUT)
+        results_json = response.json()
+        if not isinstance(results_json, dict):
+            raise InvalidDownloadResponse("Animepahe returned invalid search data.")
+        if "data" not in results_json:
+            return []
+        data = results_json["data"]
+        if not isinstance(data, list):
+            raise InvalidDownloadResponse("Animepahe returned invalid search data.")
+        if any(
+            not isinstance(result, dict)
+            or not isinstance(result.get("session"), str)
+            or not isinstance(result.get("title"), str)
+            for result in data
+        ):
+            raise InvalidDownloadResponse("Animepahe returned invalid search data.")
+        return cast(list[dict[str, str]], data)
+    except InvalidDownloadResponse:
+        raise
+    except (RequestException, DomainNameError, KeyError, TypeError, AttributeError) as error:
+        raise InvalidDownloadResponse(
+            f"{error}. Check your connection and try again later."
+        ) from error
 
 
 def extract_anime_title_page_link_and_id(

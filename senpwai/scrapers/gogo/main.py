@@ -4,6 +4,7 @@ from typing import Callable, cast
 
 from bs4 import BeautifulSoup, ResultSet, Tag
 from requests.cookies import RequestsCookieJar
+from requests.exceptions import RequestException
 from senpwai.common.scraper import (
     CLIENT,
     PARSER,
@@ -28,19 +29,35 @@ from senpwai.scrapers.gogo.constants import (
 )
 
 SESSION_COOKIES: RequestsCookieJar | None = None
+SEARCH_TIMEOUT = 30
 FIRST_REQUEST = True
 
 
 def search(keyword: str, ignore_dub=True) -> list[tuple[str, str]]:
     search_url = AJAX_SEARCH_URL + keyword
-    response = CLIENT.get(search_url)
-    content = response.json()["content"]
+    try:
+        response = CLIENT.get(search_url, timeout=SEARCH_TIMEOUT)
+        response_json = response.json()
+        if not isinstance(response_json, dict) or not isinstance(
+            response_json.get("content"), str
+        ):
+            raise InvalidDownloadResponse("Gogo returned invalid search data.")
+    except InvalidDownloadResponse:
+        raise
+    except (RequestException, DomainNameError, KeyError, TypeError, AttributeError) as error:
+        raise InvalidDownloadResponse(
+            f"{error}. Check your connection and try again later."
+        ) from error
+    content = response_json["content"]
     soup = BeautifulSoup(content, PARSER)
     a_tags = cast(list[Tag], soup.find_all("a"))
     title_and_link: list[tuple[str, str]] = []
     for a in a_tags:
         title = a.text
-        link = f'{GOGO_HOME_URL}/{a["href"]}'
+        href = a.get("href")
+        if not isinstance(href, str) or not href:
+            raise InvalidDownloadResponse("Gogo returned invalid search data.")
+        link = f'{GOGO_HOME_URL}/{href}'
         title_and_link.append((title, link))
     for title, link in title_and_link[:]:
         if ignore_dub and DUB_EXTENSION in title:

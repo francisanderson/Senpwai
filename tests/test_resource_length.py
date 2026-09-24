@@ -759,5 +759,355 @@ class ProviderVerificationTests(unittest.TestCase):
         self.assertTrue(progress.resume.is_set())
 
 
+
+
+class SearchFailureTests(unittest.TestCase):
+    @staticmethod
+    def signal_double():
+        class Signal:
+            def __init__(self, *_args):
+                self.calls = []
+                self.callback = None
+
+            def connect(self, callback):
+                self.callback = callback
+
+            def emit(self, *args):
+                self.calls.append(args)
+                if self.callback:
+                    self.callback(*args)
+
+        return Signal
+
+    def test_provider_searches_use_bounded_timeouts(self):
+        from senpwai.scrapers import gogo, pahe
+
+        pahe_response = Mock(
+            cookies={},
+            json=Mock(return_value={"data": []}),
+        )
+        with patch.object(pahe, "FIRST_REQUEST", False), patch.object(
+            pahe.CLIENT, "get", return_value=pahe_response
+        ) as pahe_get:
+            self.assertEqual(pahe.search("fixture"), [])
+        self.assertEqual(pahe_get.call_args.kwargs["timeout"], 30)
+
+        gogo_response = Mock(json=Mock(return_value={"content": ""}))
+        with patch.object(gogo.CLIENT, "get", return_value=gogo_response) as gogo_get:
+            self.assertEqual(gogo.search("fixture"), [])
+        self.assertEqual(gogo_get.call_args.kwargs["timeout"], 30)
+
+    def test_pahe_search_timeout_keeps_domain_probes_finite(self):
+        import requests
+        from senpwai.common import scraper
+        from senpwai.common.scraper import InvalidDownloadResponse
+        from senpwai.scrapers import pahe
+
+        timeout = requests.exceptions.Timeout("fixture timeout")
+
+        def fail_request(url, **kwargs):
+            raise timeout
+
+        with patch.object(pahe, "FIRST_REQUEST", True), patch.object(
+            scraper.requests, "get", side_effect=fail_request
+        ) as get, patch.object(scraper.time, "sleep"), patch.object(
+            scraper, "log_exception"
+        ):
+            with self.assertRaisesRegex(InvalidDownloadResponse, "search|connection"):
+                pahe.search("fixture")
+        provider_calls = [
+            call for call in get.call_args_list if "google.com" not in call.args[0]
+        ]
+        self.assertEqual(len(provider_calls), 4)
+        self.assertTrue(all(call.kwargs["timeout"] == 30 for call in provider_calls))
+        self.assertTrue(
+            all(
+                call.kwargs.get("timeout")
+                in (30, scraper.DOMAIN_DISCOVERY_TIMEOUT)
+                for call in get.call_args_list
+            )
+        )
+    def test_search_thread_reports_request_failure_without_finished(self):
+        import requests
+        from senpwai.common.scraper import DomainNameError, InvalidDownloadResponse
+
+        signal = self.signal_double()
+        thread_type = load_node("windows/search.py", "SearchThread", dict(
+            QThread=type("QThread", (), {"__init__": lambda self, parent=None: None}),
+            pyqtSignal=lambda *args: signal(*args),
+            SearchWindow=object,
+            Anime=object,
+            pahe=SimpleNamespace(search=Mock(side_effect=requests.exceptions.Timeout("fixture"))),
+            gogo=SimpleNamespace(search=Mock()),
+            RequestException=requests.exceptions.RequestException,
+            DomainNameError=DomainNameError,
+            InvalidDownloadResponse=InvalidDownloadResponse,
+            PAHE="PAHE",
+            GOGO="GOGO",
+        ))
+        thread = thread_type(object(), "fixture", "PAHE")
+        thread.run()
+        self.assertTrue(thread.failed.calls)
+        self.assertIn("connection", str(thread.failed.calls[0][1]).lower())
+        self.assertFalse(thread.search_finished.calls)
+
+    def test_search_failure_resets_controls_and_notifies(self):
+        thread_type = load_node("windows/search.py", "SearchWindow", dict(
+            AbstractWindow=object, Anime=object
+        ))
+        window = thread_type.__new__(thread_type)
+        window.loading = Mock()
+        window.anime_not_found = Mock()
+        window.bottom_section_stacked_widgets = Mock()
+        window.main_window = SimpleNamespace(
+            tray_icon=SimpleNamespace(make_notification=Mock())
+        )
+        window.search_thread = object()
+        window.show_search_error("Search timed out. Try again later.")
+        window.loading.stop.assert_called_once()
+        window.anime_not_found.start.assert_called_once()
+        window.bottom_section_stacked_widgets.setCurrentWidget.assert_called_once_with(
+            window.anime_not_found
+        )
+        self.assertIsNone(window.search_thread)
+        window.main_window.tray_icon.make_notification.assert_called_once_with(
+            "Search failed", "Search timed out. Try again later.", False, None
+        )
+
+    def test_stale_search_failure_does_not_reset_current_search(self):
+        thread_type = load_node("windows/search.py", "SearchWindow", dict(
+            AbstractWindow=object, Anime=object
+        ))
+        window = thread_type.__new__(thread_type)
+        window.loading = Mock()
+        window.anime_not_found = Mock()
+        window.bottom_section_stacked_widgets = Mock()
+        window.main_window = SimpleNamespace(
+            tray_icon=SimpleNamespace(make_notification=Mock())
+        )
+        window.search_thread = object()
+        window.sender = Mock(return_value=object())
+        window.show_search_error("stale failure")
+        window.loading.stop.assert_not_called()
+        window.main_window.tray_icon.make_notification.assert_not_called()
+        self.assertIsNotNone(window.search_thread)
+
+    def test_stale_search_success_does_not_replace_current_results(self):
+        thread_type = load_node("windows/search.py", "SearchWindow", dict(
+            AbstractWindow=object, Anime=object, ResultButton=Mock
+        ))
+        window = thread_type.__new__(thread_type)
+        window.loading = Mock()
+        window.results_layout = Mock()
+        window.results_widget = Mock()
+        window.bottom_section_stacked_widgets = Mock()
+        window.main_window = SimpleNamespace()
+        window.search_thread = object()
+        window.sender = Mock(return_value=object())
+        window.show_results("PAHE", [object()])
+        window.results_layout.addWidget.assert_not_called()
+        window.loading.stop.assert_not_called()
+        self.assertIsNotNone(window.search_thread)
+
+    def test_search_thread_preserves_success_signal(self):
+        signal = self.signal_double()
+        thread_type = load_node("windows/search.py", "SearchThread", dict(
+            QThread=type("QThread", (), {"__init__": lambda self, parent=None: None}),
+            pyqtSignal=lambda *args: signal(*args),
+            SearchWindow=object,
+            Anime=object,
+            pahe=SimpleNamespace(search=Mock(return_value=[])),
+            gogo=SimpleNamespace(search=Mock()),
+            RequestException=Exception,
+            DomainNameError=Exception,
+            InvalidDownloadResponse=Exception,
+            PAHE="PAHE",
+            GOGO="GOGO",
+        ))
+        thread = thread_type(object(), "fixture", "PAHE")
+        thread.run()
+        self.assertEqual(thread.search_finished.calls, [(thread, "PAHE", [])])
+        self.assertFalse(thread.failed.calls)
+
+    def test_cancelled_search_thread_does_not_emit_success(self):
+        signal = self.signal_double()
+        thread_type = load_node("windows/search.py", "SearchThread", dict(
+            QThread=type("QThread", (), {"__init__": lambda self, parent=None: None}),
+            pyqtSignal=lambda *args: signal(*args),
+            SearchWindow=object,
+            Anime=object,
+            pahe=SimpleNamespace(search=Mock(return_value=[])),
+            gogo=SimpleNamespace(search=Mock()),
+            RequestException=Exception,
+            DomainNameError=Exception,
+            InvalidDownloadResponse=Exception,
+            PAHE="PAHE",
+            GOGO="GOGO",
+        ))
+        thread = thread_type(object(), "fixture", "PAHE")
+        thread.cancel()
+        thread.run()
+        self.assertFalse(thread.search_finished.calls)
+        self.assertFalse(thread.failed.calls)
+
+    def test_owner_thread_waits_for_naruto_cleanup_before_delete(self):
+        thread_type = load_node("windows/search.py", "SearchWindow", dict(
+            AbstractWindow=object, Anime=object
+        ))
+        window = thread_type.__new__(thread_type)
+        owner = Mock()
+        naruto = SimpleNamespace(owner_thread=owner)
+        window.search_thread = None
+        window.search_threads = [owner]
+        window.pending_thread_cleanup = []
+        window.naruto_threads = [naruto]
+        window.active_naruto_owner = owner
+        window.active_naruto_thread = naruto
+        window.remove_search_thread(owner)
+        owner.deleteLater.assert_not_called()
+        window.finish_naruto_results(naruto)
+        owner.deleteLater.assert_called_once()
+        self.assertNotIn(owner, window.search_threads)
+
+    def test_search_window_shutdown_cancels_and_waits_for_workers(self):
+        thread_type = load_node("windows/search.py", "SearchWindow", dict(
+            AbstractWindow=object, Anime=object
+        ))
+        window = thread_type.__new__(thread_type)
+        search_thread, naruto_thread = Mock(), Mock()
+        window._shutdown = False
+        window.search_thread = search_thread
+        window.search_threads = [search_thread]
+        window.naruto_threads = [naruto_thread]
+        window.pending_thread_cleanup = []
+        window.active_naruto_owner = search_thread
+        window.active_naruto_thread = naruto_thread
+        window.shutdown()
+        search_thread.cancel.assert_called_once()
+        search_thread.quit.assert_called_once()
+        search_thread.wait.assert_called_once()
+        search_thread.deleteLater.assert_called_once()
+        naruto_thread.cancel.assert_called_once()
+        naruto_thread.quit.assert_called_once()
+        naruto_thread.wait.assert_called_once()
+        naruto_thread.deleteLater.assert_called_once()
+        self.assertIsNone(window.search_thread)
+        window.shutdown()
+
+    def test_thread_cleanup_waits_for_qthread_finished(self):
+        thread_type = load_node("windows/search.py", "SearchWindow", dict(
+            AbstractWindow=object, Anime=object
+        ))
+        window = thread_type.__new__(thread_type)
+        owner = Mock()
+        owner.isFinished.return_value = False
+        window.search_thread = None
+        window.search_threads = [owner]
+        window.pending_thread_cleanup = []
+        window.naruto_threads = []
+        window.remove_search_thread(owner)
+        owner.deleteLater.assert_not_called()
+        self.assertIn(owner, window.pending_thread_cleanup)
+        owner.isFinished.return_value = True
+        window.remove_search_thread(owner)
+        owner.deleteLater.assert_called_once()
+        self.assertNotIn(owner, window.pending_thread_cleanup)
+
+    def test_connectivity_probe_has_finite_timeout(self):
+        from senpwai.common import scraper
+
+        with patch.object(scraper.requests, "get", return_value=Mock()) as get:
+            self.assertTrue(scraper.has_valid_internet_connection())
+        get.assert_called_once_with(
+            "https://www.google.com", timeout=scraper.DOMAIN_DISCOVERY_TIMEOUT
+        )
+
+    def test_domain_discovery_readme_request_has_finite_timeout(self):
+        from base64 import b64encode
+        from senpwai.common import scraper
+
+        response = Mock(
+            json=Mock(
+                return_value={
+                    "content": b64encode(b"[Animepahe](https://fixture.invalid)").decode()
+                }
+            )
+        )
+        with patch.object(scraper.CLIENT, "get", return_value=response) as get:
+            scraper.get_new_home_url_from_readme("Animepahe")
+        self.assertEqual(
+            get.call_args.kwargs["timeout"], scraper.DOMAIN_DISCOVERY_TIMEOUT
+        )
+
+    def test_search_module_imports_with_multimedia_test_double(self):
+        import importlib
+        import sys
+        import types
+
+        multimedia = types.ModuleType("PyQt6.QtMultimedia")
+        multimedia.QAudioOutput = type("QAudioOutput", (), {})
+        multimedia.QMediaPlayer = type("QMediaPlayer", (), {})
+        with patch.dict(sys.modules, {"PyQt6.QtMultimedia": multimedia}):
+            sys.modules.pop("senpwai.windows.search", None)
+            module = importlib.import_module("senpwai.windows.search")
+        self.assertTrue(hasattr(module, "SearchThread"))
+
+    def test_real_search_thread_finished_boundary_is_safe_for_deferred_delete(self):
+        import importlib
+        import sys
+        import types
+        from unittest.mock import Mock
+        from PyQt6.QtCore import QObject
+        from PyQt6.QtWidgets import QApplication
+
+        multimedia = types.ModuleType("PyQt6.QtMultimedia")
+        multimedia.QAudioOutput = type("QAudioOutput", (), {})
+        multimedia.QMediaPlayer = type("QMediaPlayer", (), {})
+        with patch.dict(sys.modules, {"PyQt6.QtMultimedia": multimedia}):
+            module = importlib.import_module("senpwai.windows.search")
+        app = QApplication.instance() or QApplication([])
+        parent = QObject()
+        thread = module.SearchThread(parent, "fixture", module.PAHE)
+        results, finished = Mock(), Mock()
+        thread.search_finished.connect(results)
+        thread.finished.connect(finished)
+        with patch.object(module.pahe, "search", return_value=[]):
+            thread.start()
+            self.assertTrue(thread.wait(2000))
+        app.processEvents()
+        results.assert_called_once_with(thread, module.PAHE, [])
+        finished.assert_called_once()
+        self.assertTrue(thread.isFinished())
+        thread.deleteLater()
+        app.processEvents()
+
+    def test_malformed_search_shapes_are_typed_or_empty(self):
+        from senpwai.common.scraper import InvalidDownloadResponse
+        from senpwai.scrapers import gogo, pahe
+
+        with patch.object(pahe, "FIRST_REQUEST", False), patch.object(
+            pahe.CLIENT,
+            "get",
+            return_value=Mock(cookies={}, json=Mock(return_value={})),
+        ):
+            self.assertEqual(pahe.search("fixture"), [])
+        with patch.object(
+            gogo.CLIENT, "get", return_value=Mock(json=Mock(return_value={}))
+        ):
+            with self.assertRaisesRegex(InvalidDownloadResponse, "invalid search data"):
+                gogo.search("fixture")
+
+    def test_provider_search_converts_request_failure_to_typed_error(self):
+        import requests
+        from senpwai.common.scraper import InvalidDownloadResponse
+        from senpwai.scrapers import pahe
+
+        with patch.object(
+            pahe, "site_request", side_effect=requests.exceptions.Timeout("fixture")
+        ):
+            with self.assertRaisesRegex(InvalidDownloadResponse, "search|connection|retry"):
+                pahe.search("fixture")
+
+
 if __name__ == "__main__":
     unittest.main()

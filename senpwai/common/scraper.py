@@ -22,6 +22,7 @@ QUALITY_REGEX_1 = re.compile(r"\b(\d{3,4})p\b")
 QUALITY_REGEX_2 = re.compile(r"\b\d+x(\d+)\b")
 NETWORK_RETRY_LIMIT = 3
 NETWORK_RETRY_WAIT_TIME = 1
+DOMAIN_DISCOVERY_TIMEOUT = 10
 GITHUB_API_README_URL = "https://api.github.com/repos/SenZmaKi/Senpwai/readme"
 RESOURCE_MOVED_STATUS_CODES = (301, 302, 307, 308)
 VERIFICATION_STATUS_CODES = frozenset((403, 429))
@@ -165,7 +166,12 @@ def get_new_home_url_from_readme(site_name: str) -> str:
     :param site_name: Can be either Animepahe or Gogoanime.
     :return: The new home url.
     """
-    encoded_readme_text = CLIENT.get(GITHUB_API_README_URL).json()["content"]
+    timeout = globals().get("DOMAIN_DISCOVERY_TIMEOUT", 10)
+    if hasattr(CLIENT, "make_request"):
+        response = CLIENT.get(GITHUB_API_README_URL, timeout=timeout)
+    else:
+        response = CLIENT.get(GITHUB_API_README_URL)
+    encoded_readme_text = response.json()["content"]
     readme_text = b64decode(encoded_readme_text).decode("utf-8")
     new_domain_name = cast(
         re.Match, re.search(rf"\[{site_name}\]\((.*)\)", readme_text)
@@ -183,7 +189,7 @@ class DomainNameError(Exception):
 
 def has_valid_internet_connection() -> bool:
     try:
-        requests.get("https://www.google.com")
+        requests.get("https://www.google.com", timeout=DOMAIN_DISCOVERY_TIMEOUT)
         return True
     except requests.exceptions.RequestException:
         return False
