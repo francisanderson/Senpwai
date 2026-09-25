@@ -52,6 +52,7 @@ tqdm = "^4.66.1"
 argparse = "^1.4.0"
 pylnk3 = "^0.4.2"
 pyqt6 = "^6.6.1"
+playwright = "^1.63.0"
 
 [tool.poetry.group.dev.dependencies]
 cx-freeze = "^6.15.12"
@@ -74,6 +75,7 @@ announce = "python -m scripts.announce"
 announce_discord = "python scripts/announce/discord.py"
 announce_reddit = "python  scripts/announce/reddit.py"
 format = "python -m scripts.ruff --format"
+install_animepahe_browser = "playwright install chromium"
 lint_fix = "python -m scripts.ruff --lint_fix"
 lint = "python -m scripts.ruff --lint"
 build_release_test = [

@@ -291,7 +291,9 @@ class PaheLinkResponseTests(unittest.TestCase):
     def test_missing_kwik_link_raises_actionable_error(self):
         from senpwai.scrapers.pahe import main as pahe
 
-        with patch.object(pahe.CLIENT, "get", return_value=SimpleNamespace(text="<html>Unavailable</html>")):
+        with patch.object(pahe, "get_browser_session", return_value=Mock(request=Mock(
+            return_value=SimpleNamespace(text="<html>Unavailable</html>")
+        ))):
             with self.assertRaisesRegex(InvalidDownloadResponse, "Animepahe.*[Rr]etry"):
                 pahe.GetDirectDownloadLinks().get_direct_download_links(["https://fixture.invalid/page"])
 
@@ -299,13 +301,15 @@ class PaheLinkResponseTests(unittest.TestCase):
         from senpwai.scrapers.pahe import main as pahe
 
         progress = Mock()
-        with patch.object(pahe.CLIENT, "get", side_effect=[
+        browser = Mock()
+        browser.request.side_effect = [
             SimpleNamespace(text="https://kwik.cx/f/fixture"),
             SimpleNamespace(text="<html>Unavailable</html>"),
-        ]) as get:
+        ]
+        with patch.object(pahe, "get_browser_session", return_value=browser):
             with self.assertRaisesRegex(InvalidDownloadResponse, "Animepahe.*parameters.*[Rr]etry"):
                 pahe.GetDirectDownloadLinks().get_direct_download_links(["page1", "page2"], progress)
-        self.assertEqual(get.call_count, 2)
+        self.assertEqual(browser.request.call_count, 2)
         progress.assert_not_called()
 
     def test_cli_closes_progress_bar_on_provider_error(self):
@@ -365,19 +369,28 @@ class PaheLinkResponseTests(unittest.TestCase):
         from senpwai.scrapers.pahe import main as pahe
 
         progress = Mock()
-        with patch.object(pahe.CLIENT, "get", side_effect=[
+        browser = Mock()
+        browser.request.side_effect = [
             SimpleNamespace(text="https://kwik.cx/f/fixture"),
-            SimpleNamespace(text='("abc",1,"abc",1,2,3)', cookies={}),
-        ] * 2), patch.object(pahe, "decrypt_post_form", return_value=
+            SimpleNamespace(text='("abc",1,"abc",1,2,3)'),
+            SimpleNamespace(headers={"Location": "https://fixture.invalid/1.mp4"}),
+            SimpleNamespace(text="https://kwik.cx/f/fixture"),
+            SimpleNamespace(text='("abc",1,"abc",1,2,3)'),
+            SimpleNamespace(headers={"Location": "https://fixture.invalid/2.mp4"}),
+        ]
+        with patch.object(pahe, "get_browser_session", return_value=browser), patch.object(
+            pahe, "decrypt_post_form", return_value=
             '<form action="https://fixture.invalid/post"><input value="x"></form>'
-        ), patch.object(pahe.CLIENT, "post", side_effect=[
-            SimpleNamespace(headers={"Location": f"https://fixture.invalid/{i}.mp4"})
-            for i in (1, 2)
-        ]):
+        ):
             links = pahe.GetDirectDownloadLinks().get_direct_download_links(["page1", "page2"], progress)
         self.assertEqual(links, ["https://fixture.invalid/1.mp4", "https://fixture.invalid/2.mp4"])
         self.assertEqual(progress.call_count, 2)
         progress.assert_called_with(1)
+        post_calls = [
+            call for call in browser.request.call_args_list if call.args[0] == "POST"
+        ]
+        self.assertEqual(post_calls[0].kwargs["form"], {"_token": "x"})
+        self.assertNotIn("data", post_calls[0].kwargs)
 
 
 class PaheEpisodeResponseTests(unittest.TestCase):
@@ -681,17 +694,16 @@ class ProviderVerificationTests(unittest.TestCase):
             )
 
     def test_pahe_direct_link_propagates_supported_action(self):
-        from senpwai.common import scraper
-        from senpwai.scrapers.pahe.main import GetDirectDownloadLinks
+        from senpwai.scrapers.pahe import main as pahe
 
         blocked = self.blocked_response(status=429)
-        with patch.object(scraper.requests, "get", return_value=blocked):
+        browser = Mock(request=Mock(return_value=blocked))
+        with patch.object(pahe, "get_browser_session", return_value=browser):
             with self.assertRaisesRegex(InvalidDownloadResponse, "verification|browser|retry"):
-                GetDirectDownloadLinks().get_direct_download_links(["page"])
+                pahe.GetDirectDownloadLinks().get_direct_download_links(["page"])
 
     def test_pahe_real_nonstream_challenge_response_is_actionable(self):
-        from senpwai.common import scraper
-        from senpwai.scrapers.pahe.main import GetDirectDownloadLinks
+        from senpwai.scrapers.pahe import main as pahe
         import requests
 
         challenge = requests.Response()
@@ -700,27 +712,27 @@ class ProviderVerificationTests(unittest.TestCase):
         challenge.encoding = "utf-8"
         challenge._content = b"<html>Checking your browser</html>"
         challenge.close = Mock()
-        with patch.object(scraper.requests, "get", return_value=challenge) as get:
+        browser = Mock(request=Mock(return_value=challenge))
+        with patch.object(pahe, "get_browser_session", return_value=browser):
             with self.assertRaisesRegex(InvalidDownloadResponse, "verification|browser|retry"):
-                GetDirectDownloadLinks().get_direct_download_links(["page"])
-        get.assert_called_once()
+                pahe.GetDirectDownloadLinks().get_direct_download_links(["page"])
+        browser.request.assert_called_once()
         challenge.close.assert_called_once()
 
     def test_cancelled_direct_link_does_not_start_a_request(self):
-        from senpwai.common import scraper
-        from senpwai.scrapers.pahe.main import GetDirectDownloadLinks
+        from senpwai.scrapers.pahe import main as pahe
 
-        collector = GetDirectDownloadLinks()
+        collector = pahe.GetDirectDownloadLinks()
         collector.cancel()
-        with patch.object(scraper.requests, "get") as get:
+        browser = Mock()
+        with patch.object(pahe, "get_browser_session", return_value=browser):
             self.assertEqual(collector.get_direct_download_links(["page"]), [])
-        get.assert_not_called()
+        browser.request.assert_not_called()
 
     def test_cancellation_between_pahe_requests_stops_before_next_request(self):
-        from senpwai.common import scraper
-        from senpwai.scrapers.pahe.main import GetDirectDownloadLinks
+        from senpwai.scrapers.pahe import main as pahe
 
-        collector = GetDirectDownloadLinks()
+        collector = pahe.GetDirectDownloadLinks()
         first_response = SimpleNamespace(
             status_code=200,
             headers={"Content-Type": "text/html"},
@@ -732,9 +744,10 @@ class ProviderVerificationTests(unittest.TestCase):
             collector.cancel()
             return first_response
 
-        with patch.object(scraper.requests, "get", side_effect=first_get) as get:
+        browser = Mock(request=Mock(side_effect=first_get))
+        with patch.object(pahe, "get_browser_session", return_value=browser):
             self.assertEqual(collector.get_direct_download_links(["page"]), [])
-        get.assert_called_once()
+        browser.request.assert_called_once()
 
     def test_network_errors_stop_after_bounded_retries(self):
         from senpwai.common import scraper

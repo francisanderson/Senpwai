@@ -3,22 +3,19 @@ from typing import Any, Callable, NamedTuple, cast
 from requests import Response
 from bs4 import BeautifulSoup, Tag
 from senpwai.common.scraper import (
-    CLIENT,
     PARSER,
     AiringStatus,
     AnimeMetadata,
-    DomainNameError,
     InvalidDownloadResponse,
     ProgressFunction,
     raise_for_provider_verification,
-    get_new_home_url_from_readme,
     closest_quality_index,
 )
+from senpwai.common.browser import get_browser_session
 from senpwai.scrapers.pahe.constants import (
     CHAR_MAP_BASE,
     CHAR_MAP_DIGITS,
     PAHE_HOME_URL,
-    FULL_SITE_NAME,
     API_ENTRY_POINT,
     ANIME_PAGE_URL,
     LOAD_EPISODES_URL,
@@ -29,49 +26,20 @@ from senpwai.scrapers.pahe.constants import (
     PARAM_REGEX,
 )
 
-FIRST_REQUEST = True
-COOKIES = {"__ddg1_": "", "__ddg2_": ""}
-"""
-For some reason these cookies just need to be set as in they don't even need to be valid
-If something crashes, try updating to something like: 
-COOKIES = {
-    "__ddg1_": f"; Expires=Tue, 19 Jan 2038 03:14:07 GMT; Domain={PAHE_DOMAIN}; Path=/",
-    "__ddg2_": f"; Expires=Tue, 19 Jan 2038 03:14:07 GMT; Domain={PAHE_DOMAIN}; Path=/",
-}
-Also it seems currently only __ddg2_ is necessary
-"""
+SEARCH_TIMEOUT = 30
 
 
-def site_request(url: str, allow_redirects=False) -> Response:
-    """
-    For requests that go specifically to the domain animepahe.ru instead of e.g., pahe.win or kwik.si
-    Typically these requests need the cookies
-    """
-    try:
-        # We only want to handle the domain change incase this is the first request
-        # This is to avoid raising DomainNameError when the something else broke instead
-        global FIRST_REQUEST
-        if FIRST_REQUEST:
-            FIRST_REQUEST = False
-            response = CLIENT.get(
-                url,
-                cookies=COOKIES,
-                allow_redirects=allow_redirects,
-                exceptions_to_raise=(DomainNameError, KeyboardInterrupt),
-            )
-        else:
-            response = CLIENT.get(url, cookies=COOKIES, allow_redirects=allow_redirects)
-        COOKIES.update(response.cookies)
-    except DomainNameError:
-        global PAHE_HOME_URL
-        PAHE_HOME_URL = get_new_home_url_from_readme(FULL_SITE_NAME)
-        return site_request(url)
-    return response
+def site_request(url: str, allow_redirects=False, timeout=None) -> Response:
+    """Fetch an Animepahe URL through the in-memory manual browser session."""
+    return get_browser_session().request(
+        "GET", url, allow_redirects=allow_redirects, timeout=timeout
+    )
+
 
 
 def search(keyword: str) -> list[dict[str, str]]:
     search_url = f"{API_ENTRY_POINT}search&q={keyword}"
-    response = site_request(search_url)
+    response = site_request(search_url, timeout=SEARCH_TIMEOUT)
     results_json = cast(dict, response.json())
     # The search api endpoint won't return json containing the data key if no results are found
     return results_json.get("data", [])
@@ -364,8 +332,9 @@ class GetDirectDownloadLinks(ProgressFunction):
         for pahewin_link in pahewin_download_page_links:
             if self.cancelled:
                 return []
+            browser = get_browser_session()
             # Extract kwik page links
-            response = CLIENT.get(pahewin_link)
+            response = browser.request("GET", pahewin_link)
             raise_for_provider_verification(response)
             if self.cancelled:
                 response.close()
@@ -380,7 +349,7 @@ class GetDirectDownloadLinks(ProgressFunction):
             kwik_page_link = match.group()
 
             # Extract direct download links from kwik html page
-            response = CLIENT.get(kwik_page_link)
+            response = browser.request("GET", kwik_page_link)
             raise_for_provider_verification(response)
             if self.cancelled:
                 response.close()
@@ -401,11 +370,11 @@ class GetDirectDownloadLinks(ProgressFunction):
             soup = BeautifulSoup(form, PARSER)
             post_url = cast(str, cast(Tag, soup.form)["action"])
             token_value = cast(str, cast(Tag, soup.input)["value"])
-            response = CLIENT.post(
+            response = browser.request(
+                "POST",
                 post_url,
-                headers=CLIENT.make_headers({"Referer": kwik_page_link}),
-                cookies=response.cookies,
-                data={"_token": token_value},
+                headers={"Referer": kwik_page_link},
+                form={"_token": token_value},
                 allow_redirects=False,
             )
             raise_for_provider_verification(response)
