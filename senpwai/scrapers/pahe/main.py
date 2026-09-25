@@ -329,10 +329,10 @@ class GetDirectDownloadLinks(ProgressFunction):
         progress_update_callback: Callable[[int], None] | None = None,
     ) -> list[str]:
         direct_download_links: list[str] = []
-        browser = get_browser_session()
         for pahewin_link in pahewin_download_page_links:
             if self.cancelled:
                 return []
+            browser = get_browser_session()
             # Extract kwik page links
             response = browser.request("GET", pahewin_link)
             raise_for_provider_verification(response)

@@ -192,14 +192,15 @@ class BrowserSession:
         if host and host not in self._ready_hosts:
             self._ensure_host(host, url, page)
         request_timeout_ms = int(options["timeout"] * 1000)
-        response = context.request.fetch(
-            url,
-            method=method,
-            data=options["data"],
-            headers=options["headers"],
-            max_redirects=20 if options["allow_redirects"] else 0,
-            timeout=request_timeout_ms,
-        )
+        request_options = {
+            "method": method,
+            "headers": options["headers"],
+            "max_redirects": 20 if options["allow_redirects"] else 0,
+            "timeout": request_timeout_ms,
+        }
+        if options["data"] is not None:
+            request_options["data"] = options["data"]
+        response = context.request.fetch(url, **request_options)
         body = response.body()
         result = BrowserResponse(
             response.status, response.headers, body, response.url
