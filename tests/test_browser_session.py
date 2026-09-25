@@ -218,6 +218,13 @@ class BrowserSessionTests(unittest.TestCase):
         self.assertIsInstance(errors[0], BrowserUnavailableError)
         self.assertFalse(session._thread.is_alive())
 
+    def test_request_after_close_is_rejected(self):
+        playwright = FakePlaywright()
+        session = BrowserSession(playwright_factory=lambda: playwright)
+        session.close()
+        with self.assertRaisesRegex(BrowserUnavailableError, "closed"):
+            session.request("GET", "https://animepahe.pw/")
+
     def test_browser_fetch_failures_become_actionable_errors(self):
         playwright = FakePlaywright()
         playwright.browser.context.request.error = RuntimeError("network down")

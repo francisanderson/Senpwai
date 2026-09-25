@@ -1,6 +1,6 @@
 """Optional in-memory browser transport for manually verified providers."""
 import atexit
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 import os
 import threading
 import time
@@ -85,6 +85,7 @@ class BrowserSession:
         self._startup_error: Exception | None = None
         self._closed = False
         self._stop = threading.Event()
+        self._lifecycle_lock = threading.RLock()
         self._ready_hosts: set[str] = set()
         self._thread = threading.Thread(
             target=self._run, name="senpwai-browser-session", daemon=True
@@ -106,34 +107,43 @@ class BrowserSession:
         allow_redirects: bool = True,
         timeout: float | None = None,
     ) -> BrowserResponse:
-        if self._closed:
-            raise BrowserUnavailableError("The Animepahe browser session is closed.")
-        future: Future = Future()
-        self._queue.put(
-            (
-                method.upper(),
-                url,
-                {
-                    "data": data,
-                    "form": form,
-                    "headers": headers or {},
-                    "allow_redirects": allow_redirects,
-                    "timeout": timeout or self._request_timeout,
-                },
-                future,
+        with self._lifecycle_lock:
+            if self._closed:
+                raise BrowserUnavailableError("The Animepahe browser session is closed.")
+            future: Future = Future()
+            self._queue.put(
+                (
+                    method.upper(),
+                    url,
+                    {
+                        "data": data,
+                        "form": form,
+                        "headers": headers or {},
+                        "allow_redirects": allow_redirects,
+                        "timeout": timeout or self._request_timeout,
+                    },
+                    future,
+                )
             )
-        )
-        self._started.wait()
+        if not self._started.wait(timeout=self._request_timeout + 5):
+            raise BrowserUnavailableError(BROWSER_SETUP_MESSAGE)
         if self._startup_error is not None:
             raise BrowserUnavailableError(BROWSER_SETUP_MESSAGE) from self._startup_error
-        return future.result(timeout=self._interaction_timeout + self._request_timeout + 10)
+        wait_budget = 2 * self._interaction_timeout + 2 * self._request_timeout + 10
+        try:
+            return future.result(timeout=wait_budget)
+        except FutureTimeoutError as error:
+            raise InvalidDownloadResponse(
+                "Animepahe browser request timed out. Complete the challenge and try again."
+            ) from error
 
     def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        self._stop.set()
-        self._queue.put(None)
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._stop.set()
+            self._queue.put(None)
         self._thread.join()
 
     def _run(self):
@@ -287,7 +297,15 @@ class BrowserSession:
 
     def _wait_until_clear(self, page):
         deadline = time.monotonic() + self._interaction_timeout
-        while self._html_is_challenged(page.content()):
+        while True:
+            try:
+                challenged = self._html_is_challenged(page.content())
+            except Exception as error:
+                raise BrowserUnavailableError(
+                    "Could not read the Animepahe browser page."
+                ) from error
+            if not challenged:
+                return
             if self._stop.is_set():
                 raise BrowserUnavailableError(
                     "The Animepahe browser session is closed."
