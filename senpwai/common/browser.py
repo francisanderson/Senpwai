@@ -23,6 +23,7 @@ CHALLENGE_MARKERS = (
     "cf-turnstile",
     "challenges.cloudflare.com",
 )
+BROWSER_NAVIGATION_TIMEOUT = 30
 BROWSER_SETUP_MESSAGE = (
     "Animepahe needs a browser session. Install Playwright's browser with "
     "`python -m playwright install chromium`, then retry. Senpwai does not "
@@ -137,7 +138,12 @@ class BrowserSession:
             raise BrowserUnavailableError(BROWSER_SETUP_MESSAGE)
         if self._startup_error is not None:
             raise BrowserUnavailableError(BROWSER_SETUP_MESSAGE) from self._startup_error
-        wait_budget = 2 * self._interaction_timeout + 2 * self._request_timeout + 10
+        wait_budget = (
+            2 * self._interaction_timeout
+            + 2 * self._request_timeout
+            + 2 * BROWSER_NAVIGATION_TIMEOUT
+            + 10
+        )
         try:
             return future.result(timeout=wait_budget)
         except FutureTimeoutError as error:
@@ -287,7 +293,11 @@ class BrowserSession:
         parsed = urlparse(url)
         origin = f"{parsed.scheme}://{parsed.netloc}/"
         try:
-            page.goto(origin, wait_until="domcontentloaded", timeout=30000)
+            page.goto(
+                origin,
+                wait_until="domcontentloaded",
+                timeout=BROWSER_NAVIGATION_TIMEOUT * 1000,
+            )
         except Exception as error:
             raise BrowserUnavailableError(
                 f"Could not open {origin} in the Animepahe browser session."
@@ -297,7 +307,11 @@ class BrowserSession:
 
     def _wait_for_path(self, url, page):
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=BROWSER_NAVIGATION_TIMEOUT * 1000,
+            )
         except Exception as error:
             raise BrowserUnavailableError(
                 f"Could not open {url} in the Animepahe browser session."
