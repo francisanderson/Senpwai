@@ -9,6 +9,7 @@ tests/*
 !tests/test_unknown_size.py
 !tests/test_resource_length.py
 !tests/test_maintenance.py
+!tests/test_browser_session.py
 test-downloads/
 __pycache__/
 .ruff_cache/
