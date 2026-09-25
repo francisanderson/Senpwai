@@ -374,7 +374,7 @@ class GetDirectDownloadLinks(ProgressFunction):
                 "POST",
                 post_url,
                 headers={"Referer": kwik_page_link},
-                data={"_token": token_value},
+                form={"_token": token_value},
                 allow_redirects=False,
             )
             raise_for_provider_verification(response)

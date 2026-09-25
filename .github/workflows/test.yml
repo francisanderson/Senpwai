@@ -50,7 +50,9 @@ jobs:
     live-smoke:
         needs: offline
         runs-on: ubuntu-latest
-        timeout-minutes: 5
+        timeout-minutes: 10
+        env:
+            SENPWAI_BROWSER_INTERACTION_TIMEOUT: 15
 
         steps:
             - name: Install Qt runtime libraries
@@ -73,9 +75,14 @@ jobs:
                   pip install -r dev-requirements.txt
                   poetry install
 
+            - name: Install browser runtime
+              run: |
+                  sudo apt-get install --no-install-recommends -y xvfb
+                  poetry run playwright install chromium
+
             - name: Pahe live provider smoke
               id: test_pahe
-              run: poetry run poe test_pahe_dpl
+              run: xvfb-run -a poetry run poe test_pahe_dpl
 
             - name: Record live smoke outcome
               if: ${{ always() }}

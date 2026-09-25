@@ -4,7 +4,7 @@ from concurrent.futures import Future
 import os
 import threading
 import time
-from queue import Queue
+from queue import Empty, Queue
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -67,16 +67,24 @@ class BrowserSession:
     def __init__(
         self,
         playwright_factory: Callable[[], Any] | None = None,
-        interaction_timeout: float = 180,
-        request_timeout: float = 30,
+        interaction_timeout: float | None = None,
+        request_timeout: float | None = None,
     ):
         self._playwright_factory = playwright_factory
-        self._interaction_timeout = interaction_timeout
-        self._request_timeout = request_timeout
+        configured_interaction_timeout = os.environ.get(
+            "SENPWAI_BROWSER_INTERACTION_TIMEOUT"
+        )
+        self._interaction_timeout = float(
+            configured_interaction_timeout
+            if configured_interaction_timeout is not None
+            else interaction_timeout or 180
+        )
+        self._request_timeout = float(request_timeout or 30)
         self._queue: Queue[tuple[str, str, dict, Future] | None] = Queue()
         self._started = threading.Event()
         self._startup_error: Exception | None = None
         self._closed = False
+        self._stop = threading.Event()
         self._ready_hosts: set[str] = set()
         self._thread = threading.Thread(
             target=self._run, name="senpwai-browser-session", daemon=True
@@ -93,6 +101,7 @@ class BrowserSession:
         url: str,
         *,
         data: Any = None,
+        form: dict | None = None,
         headers: dict | None = None,
         allow_redirects: bool = True,
         timeout: float | None = None,
@@ -106,6 +115,7 @@ class BrowserSession:
                 url,
                 {
                     "data": data,
+                    "form": form,
                     "headers": headers or {},
                     "allow_redirects": allow_redirects,
                     "timeout": timeout or self._request_timeout,
@@ -122,8 +132,9 @@ class BrowserSession:
         if self._closed:
             return
         self._closed = True
+        self._stop.set()
         self._queue.put(None)
-        self._thread.join(timeout=5)
+        self._thread.join()
 
     def _run(self):
         playwright = browser = context = page = None
@@ -140,6 +151,9 @@ class BrowserSession:
 
         while True:
             item = self._queue.get()
+            if self._stop.is_set():
+                self._fail_queued_requests()
+                break
             if item is None:
                 break
             method, url, options, future = item
@@ -162,6 +176,17 @@ class BrowserSession:
                     close()
                 except Exception:
                     pass
+
+    def _fail_queued_requests(self):
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except Empty:
+                return
+            if item is not None:
+                item[3].set_exception(
+                    BrowserUnavailableError("The Animepahe browser session is closed.")
+                )
 
     @staticmethod
     def _launch_browser(playwright):
@@ -188,26 +213,56 @@ class BrowserSession:
         return sync_playwright().start()
 
     def _request(self, method, url, options, context, page) -> BrowserResponse:
+        if self._stop.is_set():
+            raise BrowserUnavailableError("The Animepahe browser session is closed.")
         host = (urlparse(url).hostname or "").lower()
         if host and host not in self._ready_hosts:
             self._ensure_host(host, url, page)
-        request_timeout_ms = int(options["timeout"] * 1000)
+        for attempt in range(2):
+            result = self._fetch(method, url, options, context)
+            if not self._looks_challenged(result):
+                return result
+            if attempt == 0:
+                self._wait_for_path(url, page)
+                continue
+            raise InvalidDownloadResponse(BROWSER_SETUP_MESSAGE)
+        raise InvalidDownloadResponse(BROWSER_SETUP_MESSAGE)
+
+    def _fetch(self, method, url, options, context) -> BrowserResponse:
         request_options = {
             "method": method,
             "headers": options["headers"],
             "max_redirects": 20 if options["allow_redirects"] else 0,
-            "timeout": request_timeout_ms,
+            "timeout": int(options["timeout"] * 1000),
         }
-        if options["data"] is not None:
+        if options["form"] is not None:
+            request_options["form"] = options["form"]
+        elif options["data"] is not None:
             request_options["data"] = options["data"]
-        response = context.request.fetch(url, **request_options)
-        body = response.body()
-        result = BrowserResponse(
-            response.status, response.headers, body, response.url
-        )
-        if self._looks_challenged(result):
-            raise InvalidDownloadResponse(BROWSER_SETUP_MESSAGE)
-        return result
+        response = None
+        try:
+            response = context.request.fetch(url, **request_options)
+            body = response.body()
+            headers = {
+                key: value
+                for key, value in response.headers.items()
+                if key.lower() not in ("set-cookie", "set-cookie2")
+            }
+            return BrowserResponse(response.status, headers, body, response.url)
+        except BrowserUnavailableError:
+            raise
+        except Exception as error:
+            raise InvalidDownloadResponse(
+                "Animepahe browser request failed. Check the browser session and try again."
+            ) from error
+        finally:
+            if response is not None:
+                dispose = getattr(response, "dispose", None)
+                if callable(dispose):
+                    try:
+                        dispose()
+                    except Exception:
+                        pass
 
     def _ensure_host(self, host, url, page):
         parsed = urlparse(url)
@@ -218,15 +273,31 @@ class BrowserSession:
             raise BrowserUnavailableError(
                 f"Could not open {origin} in the Animepahe browser session."
             ) from error
+        self._wait_until_clear(page)
+        self._ready_hosts.add(host)
+
+    def _wait_for_path(self, url, page):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as error:
+            raise BrowserUnavailableError(
+                f"Could not open {url} in the Animepahe browser session."
+            ) from error
+        self._wait_until_clear(page)
+
+    def _wait_until_clear(self, page):
         deadline = time.monotonic() + self._interaction_timeout
         while self._html_is_challenged(page.content()):
+            if self._stop.is_set():
+                raise BrowserUnavailableError(
+                    "The Animepahe browser session is closed."
+                )
             if time.monotonic() >= deadline:
                 raise BrowserUnavailableError(
                     "Timed out waiting for manual Animepahe verification. "
                     "Complete the challenge in the visible browser and retry."
                 )
             time.sleep(0.5)
-        self._ready_hosts.add(host)
 
     @classmethod
     def _html_is_challenged(cls, body: str) -> bool:
@@ -235,6 +306,8 @@ class BrowserSession:
 
     @classmethod
     def _looks_challenged(cls, response: BrowserResponse) -> bool:
+        if response.status_code in (403, 429):
+            return True
         content_type = response.headers.get("Content-Type", "").lower()
         return "text/html" in content_type and cls._html_is_challenged(
             response.text[:4096]

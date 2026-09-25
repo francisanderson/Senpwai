@@ -8,26 +8,41 @@ from senpwai.common.browser import (
     BrowserResponse,
     BrowserSession,
     BrowserUnavailableError,
+    InvalidDownloadResponse,
 )
 
 
 class FakeApiResponse:
     def __init__(self):
         self.status = 200
-        self.headers = {"content-type": "application/json"}
+        self.headers = {
+            "content-type": "application/json",
+            "set-cookie": "secret=should-not-escape",
+        }
         self.url = "https://animepahe.pw/api?m=search"
+        self.disposed = False
+        self.body_value = b'{"data": []}'
 
     def body(self):
-        return b'{"data": []}'
+        return self.body_value
+
+    def dispose(self):
+        self.disposed = True
 
 
 class FakeRequestContext:
     def __init__(self):
         self.calls = []
+        self.responses = []
+        self.error = None
 
     def fetch(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        return FakeApiResponse()
+        if self.error is not None:
+            raise self.error
+        response = FakeApiResponse()
+        self.responses.append(response)
+        return response
 
 
 class FakePage:
@@ -106,10 +121,27 @@ class BrowserSessionTests(unittest.TestCase):
         finally:
             session.close()
         self.assertEqual(response.status_code, 200)
+        self.assertNotIn("set-cookie", response.headers)
+        self.assertTrue(playwright.browser.context.request.responses[0].disposed)
         call = playwright.browser.context.request.calls[0]
         self.assertEqual(call[0], "https://animepahe.pw/api?m=search")
         self.assertGreaterEqual(call[1]["max_redirects"], 0)
         self.assertTrue(playwright.browser.context.page.visited)
+
+    def test_post_uses_form_encoding(self):
+        playwright = FakePlaywright()
+        session = BrowserSession(playwright_factory=lambda: playwright)
+        try:
+            session.request(
+                "POST",
+                "https://kwik.cx/f/form",
+                form={"_token": "value"},
+            )
+        finally:
+            session.close()
+        call = playwright.browser.context.request.calls[0][1]
+        self.assertEqual(call["form"], {"_token": "value"})
+        self.assertNotIn("data", call)
 
     def test_session_waits_for_manual_challenge_completion(self):
         playwright = FakePlaywright()
@@ -142,6 +174,59 @@ class BrowserSessionTests(unittest.TestCase):
             self.assertEqual(pahe.search("fixture"), [])
         self.assertEqual(browser.request.call_args.args[:2], ("GET", pahe.API_ENTRY_POINT + "search&q=fixture"))
         self.assertEqual(browser.request.call_args.kwargs["timeout"], pahe.SEARCH_TIMEOUT)
+
+    def test_path_challenge_is_opened_for_manual_completion(self):
+        playwright = FakePlaywright()
+        first = FakeApiResponse()
+        first.status = 403
+        first.headers = {"content-type": "text/html"}
+        first.body_value = b"<html><title>Just a moment...</title></html>"
+        calls = []
+
+        def fetch(url, **kwargs):
+            calls.append((url, kwargs))
+            return first if len(calls) == 1 else FakeApiResponse()
+
+        playwright.browser.context.request.fetch = fetch
+        session = BrowserSession(playwright_factory=lambda: playwright)
+        try:
+            response = session.request("GET", "https://animepahe.pw/api?m=search")
+        finally:
+            session.close()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("https://animepahe.pw/api?m=search", [url for url, _ in playwright.browser.context.page.visited])
+
+    def test_close_interrupts_a_waiting_manual_challenge(self):
+        playwright = FakePlaywright()
+        playwright.browser.context.page.challenge = True
+        session = BrowserSession(playwright_factory=lambda: playwright, interaction_timeout=10)
+        errors = []
+
+        def request():
+            try:
+                session.request("GET", "https://animepahe.pw/")
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=request)
+        thread.start()
+        time.sleep(0.05)
+        session.close()
+        thread.join(timeout=2)
+        self.assertTrue(errors)
+        self.assertIsInstance(errors[0], BrowserUnavailableError)
+        self.assertFalse(session._thread.is_alive())
+
+    def test_browser_fetch_failures_become_actionable_errors(self):
+        playwright = FakePlaywright()
+        playwright.browser.context.request.error = RuntimeError("network down")
+        session = BrowserSession(playwright_factory=lambda: playwright)
+        try:
+            with self.assertRaisesRegex(InvalidDownloadResponse, "browser request failed"):
+                session.request("GET", "https://animepahe.pw/api?m=search")
+        finally:
+            session.close()
 
     def test_missing_playwright_is_actionable(self):
         def missing_playwright():
