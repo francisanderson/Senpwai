@@ -386,6 +386,11 @@ class PaheLinkResponseTests(unittest.TestCase):
         self.assertEqual(links, ["https://fixture.invalid/1.mp4", "https://fixture.invalid/2.mp4"])
         self.assertEqual(progress.call_count, 2)
         progress.assert_called_with(1)
+        post_calls = [
+            call for call in browser.request.call_args_list if call.args[0] == "POST"
+        ]
+        self.assertEqual(post_calls[0].kwargs["form"], {"_token": "x"})
+        self.assertNotIn("data", post_calls[0].kwargs)
 
 
 class PaheEpisodeResponseTests(unittest.TestCase):
