@@ -218,6 +218,13 @@ class BrowserSessionTests(unittest.TestCase):
         self.assertIsInstance(errors[0], BrowserUnavailableError)
         self.assertFalse(session._thread.is_alive())
 
+    def test_close_returns_when_idle_and_marks_session_closed(self):
+        playwright = FakePlaywright()
+        session = BrowserSession(playwright_factory=lambda: playwright)
+        self.assertTrue(session.close())
+        self.assertTrue(session.closed)
+        self.assertTrue(session.finished)
+
     def test_request_after_close_is_rejected(self):
         playwright = FakePlaywright()
         session = BrowserSession(playwright_factory=lambda: playwright)

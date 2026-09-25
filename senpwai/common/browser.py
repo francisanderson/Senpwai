@@ -96,6 +96,14 @@ class BrowserSession:
     def unavailable(self) -> bool:
         return self._startup_error is not None
 
+    @property
+    def finished(self) -> bool:
+        return not self._thread.is_alive()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     def request(
         self,
         method: str,
@@ -144,7 +152,8 @@ class BrowserSession:
             self._closed = True
             self._stop.set()
             self._queue.put(None)
-        self._thread.join()
+        self._thread.join(timeout=self._request_timeout + 5)
+        return self.finished
 
     def _run(self):
         playwright = browser = context = page = None
@@ -341,6 +350,8 @@ def get_browser_session() -> BrowserSession:
     with _SESSION_LOCK:
         if _SESSION is not None and _SESSION.unavailable:
             _SESSION.close()
+            _SESSION = None
+        if _SESSION is not None and _SESSION.closed and _SESSION.finished:
             _SESSION = None
         if _SESSION is None:
             _SESSION = BrowserSession()
