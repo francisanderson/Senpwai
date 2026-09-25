@@ -175,6 +175,16 @@ poetry install
 
 On POSIX shells, use `python3.11 -m venv .venv` and `. .venv/bin/activate` instead. On Ubuntu, install the Qt runtime libraries needed by the offscreen GUI tests: `libegl1 libgl1 libxkbcommon0`.
 
+### Animepahe browser verification
+
+Animepahe may require an interactive Cloudflare verification. After installing dependencies, install the browser binary once:
+
+```text
+poetry run playwright install chromium
+```
+
+When an Animepahe request needs verification, the app opens a visible browser session. Complete the verification manually there; the session stays in memory and is not exported to settings or disk. Senpwai does not automate CAPTCHA solving or bypass provider access controls. If the browser is unavailable, Animepahe reports the setup command above instead of hanging.
+
 ### Offline checks (no provider requests)
 
 Run these before reviewing or merging a change:
@@ -209,7 +219,7 @@ poetry run poe test_gogo_hls
 
 ### Current fork baseline
 
-At the time this maintenance slice was prepared, the offline suite passed **54 tests** and `compileall` passed. The first Ubuntu workflow run exposed a missing `libEGL.so.1` runtime dependency in the existing offscreen GUI tests; the workflow now installs the Qt runtime packages instead of skipping those tests. The required offline job then passed, while the separate Pahe live smoke failed on the external provider with `requests.exceptions.JSONDecodeError`; that failure remains visible and unsuppressed. Full Ruff was not clean locally: it reported four pre-existing findings in the untracked `tasks/probe_gogo.py` and `tasks/test_response_consumers.py` probes. They are recorded rather than suppressed or deleted. Poetry/Poe and the packaging commands were unavailable in the current shell, so release builds were not claimed as passing.
+At the time this maintenance slice was prepared, the offline suite passed **59 tests** and `compileall` passed. The first Ubuntu workflow run exposed a missing `libEGL.so.1` runtime dependency in the existing offscreen GUI tests; the workflow now installs the Qt runtime packages instead of skipping those tests. The required offline job then passed, while the separate Pahe live smoke failed on the external provider with `requests.exceptions.JSONDecodeError`; that failure remains visible and unsuppressed. Full Ruff was not clean locally: it reported four pre-existing findings in the untracked `tasks/probe_gogo.py` and `tasks/test_response_consumers.py` probes. They are recorded rather than suppressed or deleted. The browser transport has offline fake-browser coverage; a real manual browser verification and release build remain environment-dependent.
 
 
 
