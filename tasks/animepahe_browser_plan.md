@@ -27,6 +27,6 @@ Make the legacy Python app usable against the current Animepahe `.pw` challenge 
 
 ## Current evidence
 
-Upstream v3.0.0 uses an embedded browser transport and waits for user interaction; it is a separate Flutter/Dart architecture, not a drop-in Python patch. The legacy app currently has no browser dependency or transport.
+Upstream v3.0.0 uses an embedded browser transport and waits for user interaction; it is a separate Flutter/Dart architecture, not a drop-in Python patch. The legacy app now has a Playwright-based in-memory transport with a visible manual-challenge boundary.
 
-A real Playwright/Chromium probe launched the visible browser against `https://animepahe.pw/`, detected the interactive challenge, and timed out waiting for manual verification as designed. No challenge was solved automatically and no cookies were exported.
+A real Playwright/Chromium probe launched the visible browser against `https://animepahe.pw/`, detected the interactive challenge, and timed out waiting for manual verification as designed. No challenge was solved automatically and no cookies were exported. Offline coverage includes fake-browser lifecycle, form, path-challenge, error, cookie-filtering, disposal, and setup-error contracts; post-challenge media transfer remains unverified.
